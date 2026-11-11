@@ -1,4 +1,5 @@
 *.hdf5
+*.pt
 .idea/
 __pycache__/
 Graph/
@@ -6,3 +7,11 @@ Graph/
 *.dat
 *_old*
 *.svg
+*.npz
+*.parquet
+plots/
+data/
+wandb/
+checkpoints/
+
+skills/*

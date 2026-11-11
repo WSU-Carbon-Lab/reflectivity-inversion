@@ -7,11 +7,18 @@ authors = [
     { name = "Harlan D Heilman", email = "73567020+HarlanHeilman@users.noreply.github.com" }
 ]
 requires-python = ">=3.13"
-dependencies = []
+dependencies = [
+    "huggingface-hub>=1.0.0",
+    "matplotlib>=3.11.2",
+    "periodictable>=2.1.0",
+    "polars>=2.1.0",
+    "pyarrow>=20.0.0",
+    "refloxide[plugin]>=0.3.0",
+    "torch>=2.15.0",
+    "wandb>=0.31.0",
+]
 
-[project.scripts]
-ml-reflectivity = "ml_reflectivity:main"
+[tool.uv]
+# Scripts-only project: the code lives in scripts/ and is not installed.
+package = false
 
-[build-system]
-requires = ["uv_build>=0.12.6,<0.13.0"]
-build-backend = "uv_build"
