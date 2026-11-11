@@ -1,7 +1,7 @@
 [project]
 name = "ml-reflectivity"
 version = "0.1.0"
-description = "Add your description here"
+description = "Refltron: neural-network inversion of polarized X-ray reflectivity into thin-film parameters"
 readme = "README.md"
 authors = [
     { name = "Harlan D Heilman", email = "73567020+HarlanHeilman@users.noreply.github.com" }

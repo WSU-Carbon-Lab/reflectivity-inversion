@@ -15,3 +15,9 @@ wandb/
 checkpoints/
 
 skills/*
+
+# Generated outputs (training logs, analysis figures; published results live on the Hub)
+logs/
+analysis/runs/
+*.out
+.venv/
