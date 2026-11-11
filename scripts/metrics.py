@@ -330,8 +330,14 @@ def plot_sample_column(
 class MetricStore:
     """Handles W&B logging, checkpoint files, and 4-column sample + OOD snapshot plots."""
 
-    def __init__(self, model, criterion, dataset, train_set, val_set, device, args):
+    def __init__(
+        self, model, criterion, dataset, train_set, val_set, device, args,
+        optimizer=None, scheduler=None, resume=None,
+    ):
         self.model = model
+        # Saved inside checkpoints so a stopped run can be continued exactly (--resume).
+        self.optimizer = optimizer
+        self.scheduler = scheduler
         self.criterion = criterion
         self.loss_name = args.loss
         # The snapshot figures always report the depth-profile distance, whatever the training loss.
@@ -405,6 +411,9 @@ class MetricStore:
             "train_sample_idx": self.train_sample_idx,
             "val_sample_idx": self.val_sample_idx,
         }
+        if resume is not None:
+            self.config["resumed_from"] = str(args.resume)
+            self.config["resumed_at_epoch"] = resume["epoch"]
         self.run = wandb.init(
             entity=WANDB_ENTITY,
             project=WANDB_PROJECT,
@@ -414,11 +423,20 @@ class MetricStore:
             settings=wandb.Settings(base_url=WANDB_BASE_URL),
         )
 
-        run_id = self.run.id if self.run.id else "local-run"
-        self.ckpt_dir = Path(args.checkpoint_dir) / run_id
+        # A resumed run keeps writing into the original run's folder.
+        if resume is not None:
+            self.ckpt_dir = Path(args.resume).parent
+        else:
+            run_id = self.run.id if self.run.id else "local-run"
+            self.ckpt_dir = Path(args.checkpoint_dir) / run_id
         self.ckpt_dir.mkdir(parents=True, exist_ok=True)
 
         self.best_val_loss = float("inf")
+        if resume is not None:
+            best_path = self.ckpt_dir / "best.pt"
+            if best_path.is_file():
+                best = torch.load(best_path, map_location="cpu", weights_only=False)
+                self.best_val_loss = best["val_loss"]
         self.saved_checkpoints = []
 
     @torch.no_grad()
@@ -499,16 +517,18 @@ class MetricStore:
         ckpt_path = self.ckpt_dir / f"{name}.pt"
         fig_path = self.ckpt_dir / f"{name}.png"
 
-        torch.save(
-            {
-                "epoch": epoch,
-                "val_loss": val_loss,
-                "model_state_dict": self.model.state_dict(),
-                "label_names": LABEL_NAMES,
-                "config": self.config,
-            },
-            ckpt_path,
-        )
+        checkpoint = {
+            "epoch": epoch,
+            "val_loss": val_loss,
+            "model_state_dict": self.model.state_dict(),
+            "label_names": LABEL_NAMES,
+            "config": self.config,
+        }
+        if self.optimizer is not None:
+            checkpoint["optimizer_state_dict"] = self.optimizer.state_dict()
+        if self.scheduler is not None:
+            checkpoint["scheduler_state_dict"] = self.scheduler.state_dict()
+        torch.save(checkpoint, ckpt_path)
         self._save_snapshot_plot(
             fig_path, epoch, train_loss, val_loss,
             target_norm, pred_norm, pred_phys, profile_losses,

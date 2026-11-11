@@ -3,6 +3,7 @@
     uv run python scripts/train.py                   # use the defaults below
     uv run python scripts/train.py --epochs 20 --max-samples 50000 --local   # quick test
     uv run python scripts/train.py --help            # list every option
+    uv run python scripts/train.py --resume checkpoints/<run>/best.pt   # continue a stopped run
 
 Every option has a default in the DEFAULT SETTINGS block. Edit a value there to change
 it permanently, or pass the matching command-line flag to change it for one run.
@@ -17,6 +18,7 @@ What happens:
 """
 
 import argparse
+import warnings
 from pathlib import Path
 
 import polars as pl
@@ -62,10 +64,12 @@ RUN_NAME = None             # optional W&B run name
 CHECKPOINT_DIR = Path("checkpoints")
 CHECKPOINT_EVERY = None     # save a numbered checkpoint every N epochs (None = 20 with LOCAL, else 5)
 MAX_CHECKPOINTS = 3         # keep only the newest N numbered checkpoints (best.pt is always kept)
+RESUME = None               # path to a .pt checkpoint to continue training from (None = start fresh)
 
 
 def main():
     args = parse_args()
+    resume = load_resume_checkpoint(args) if args.resume else None
     torch.manual_seed(args.seed)
     device = select_device(args.device)
     print(f"Device: {device} | regularizer={args.regularizer} | activation={args.activation} | loss={args.loss}")
@@ -97,19 +101,27 @@ def main():
     profile_metric = DepthProfileLoss().to(device)
     mse_metric = LabelMSELoss().to(device)
 
+    start_epoch = 1
+    if resume is not None:
+        start_epoch = restore_training_state(resume, model, optimizer, scheduler)
+        print(f"Resuming from {args.resume} at epoch {start_epoch}/{args.epochs}")
+
     # Logging, checkpoints and snapshot figures.
-    tracker = MetricStore(model, criterion, dataset, train_set, val_set, device, args)
+    tracker = MetricStore(
+        model, criterion, dataset, train_set, val_set, device, args,
+        optimizer=optimizer, scheduler=scheduler, resume=resume,
+    )
 
     # 3. Training loop
-    for epoch in range(1, args.epochs + 1):
+    for epoch in range(start_epoch, args.epochs + 1):
         train_loss = train_one_epoch(model, train_loader, criterion, optimizer, device)
         val = evaluate(model, val_loader, criterion, profile_metric, mse_metric, device)
-        tracker.store_metrics(
-            epoch, train_loss, val["loss"], val["mae"], val["profile_l2"], val["mse"],
-            lr=optimizer.param_groups[0]["lr"],
-        )
+        lr_used = optimizer.param_groups[0]["lr"]  # the learning rate this epoch trained with
         if scheduler is not None:
-            scheduler.step()
+            scheduler.step()  # step before saving, so checkpoints hold the next epoch's LR
+        tracker.store_metrics(
+            epoch, train_loss, val["loss"], val["mae"], val["profile_l2"], val["mse"], lr=lr_used,
+        )
 
     tracker.finish()
 
@@ -221,6 +233,50 @@ def build_model(args, dataset, train_set):
     return model
 
 
+# Settings that define the run. When resuming, these come from the checkpoint so the
+# continued run matches the original one.
+RESUMED_SETTINGS = (
+    "epochs", "batch_size", "lr", "mix_channels", "regularizer", "loss", "val_split",
+    "seed", "local", "activation", "normalize_inputs", "lr_schedule", "lr_min_frac",
+    "max_samples", "run_name",
+)
+
+
+def load_resume_checkpoint(args):
+    """Load a checkpoint and copy its run settings onto ``args`` (--epochs may extend the run)."""
+    checkpoint = torch.load(args.resume, map_location="cpu", weights_only=False)
+    config = checkpoint["config"]
+    epochs_from_cli = args.epochs if args.epochs != EPOCHS else None
+    for name in RESUMED_SETTINGS:
+        if name in config:
+            setattr(args, name, config[name])
+    if epochs_from_cli is not None:
+        args.epochs = epochs_from_cli
+    return checkpoint
+
+
+def restore_training_state(checkpoint, model, optimizer, scheduler):
+    """Put the weights (and optimizer / LR schedule, if saved) back; return the next epoch."""
+    model.load_state_dict(checkpoint["model_state_dict"])
+    done = checkpoint["epoch"]
+    if "optimizer_state_dict" in checkpoint:
+        optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+    else:
+        # Older checkpoints only stored weights: Adam restarts its running averages,
+        # which it rebuilds within a few hundred steps.
+        print("Checkpoint has no optimizer state; Adam starts fresh from these weights.")
+    if scheduler is not None:
+        if "scheduler_state_dict" in checkpoint:
+            scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
+        else:
+            # Fast-forward the schedule to where the original run stopped.
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                for _ in range(done):
+                    scheduler.step()
+    return done + 1
+
+
 def select_device(requested):
     """Use the requested device, or with "auto" the fastest one available."""
     if requested != "auto":
@@ -267,6 +323,7 @@ def parse_args():
     log.add_argument("--checkpoint-dir", type=Path, default=CHECKPOINT_DIR, help="where checkpoints are written")
     log.add_argument("--checkpoint-every", type=int, default=CHECKPOINT_EVERY, help="epochs between numbered checkpoints")
     log.add_argument("--max-checkpoints", type=int, default=MAX_CHECKPOINTS, help="numbered checkpoints to keep")
+    log.add_argument("--resume", type=Path, default=RESUME, help="checkpoint to continue from (its run settings are reused)")
     return parser.parse_args()
 
 
