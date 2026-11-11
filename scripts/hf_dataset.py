@@ -26,6 +26,7 @@ def write_dataset_card(
     n_q: int,
     repo_id: str,
     revision: str,
+    isotropic: bool,
     q_range: tuple[float, float],
     energy_ev: float,
     film_thickness_range: tuple[float, float],
@@ -45,6 +46,30 @@ def write_dataset_card(
     has_plots = copy_plots(dataset_dir, plot_dir)
     total_points = n_samples * n_q
 
+    # Text that depends on the film type.
+    if isotropic:
+        film_name = "isotropic"
+        optics_text = (
+            "The film is isotropic: one `δ` drawn uniformly from "
+            f"`[{delta_range[0]:.1e}, {delta_range[1]:.1e}]` and one `β` from `[0, {beta_max:.1e}]`, "
+            "written to both tensor columns (`delta_xx = delta_zz`, `beta_xx = beta_zz`) so the "
+            "schema matches the uniaxial branches. Models only need 5 labels: film thickness, "
+            "film roughness, oxide thickness, `delta_xx` and `beta_xx`."
+        )
+        delta_xx_text, delta_zz_text = "Film dispersion `δ`", "Same as `delta_xx` (isotropic film)"
+        beta_xx_text, beta_zz_text = "Film absorption `β`", "Same as `beta_xx` (isotropic film)"
+    else:
+        film_name = "uniaxial anisotropic"
+        optics_text = (
+            "Uniaxial optical constants are drawn in polar form (`component_xx = magnitude · cos(angle)`, "
+            "`component_zz = magnitude · sin(angle)`) and stored directly as Cartesian tensor "
+            "components (`delta_xx`, `delta_zz`, `beta_xx`, `beta_zz`)."
+        )
+        delta_xx_text = "In-plane (ordinary) dispersion `δ_xx = δ cos α`"
+        delta_zz_text = "Out-of-plane (extraordinary) dispersion `δ_zz = δ sin α`"
+        beta_xx_text = "In-plane (ordinary) absorption `β_xx = β cos γ`"
+        beta_zz_text = "Out-of-plane (extraordinary) absorption `β_zz = β sin γ`"
+
     figures_section = ""
     if has_plots:
         figures_section = f"""
@@ -52,11 +77,11 @@ def write_dataset_card(
 
 ## Example Sample
 
-![Example s/p reflectivity curves and uniaxial optical-constant depth profile](plots/single_sample.png)
+![Example s/p reflectivity curves and optical-constant depth profile](plots/single_sample.png)
 
 *Top: simulated `s`- and `p`-polarized power reflectivity `R_s(q)` and `R_p(q)`
 on the fixed {n_q}-point `q` grid at {energy_ev:.0f} eV. Bottom: corresponding
-erf-smoothed uniaxial refractive-index depth profile (`1 - n = δ - iβ`) showing
+erf-smoothed refractive-index depth profile (`1 - n = δ - iβ`) showing
 in-plane (`δ_xx`, `β_xx`) and out-of-plane (`δ_zz`, `β_zz`) components across
 the `vacuum | film | oxide | silicon` interfaces.*
 
@@ -70,9 +95,7 @@ Sampling proceeds in two stages so every interface remains strictly inside the
 Nevot–Croce validity regime (`thickness ≥ 2π · roughness`): film and native
 oxide thicknesses are drawn first, followed by film roughness capped at
 `min({film_roughness_max:.0f} Å, t_film / 2π)` and oxide roughness coupled via `σ_oxide = t_oxide / 2π`.
-Uniaxial optical constants are drawn in polar form (`component_xx = magnitude · cos(angle)`,
-`component_zz = magnitude · sin(angle)`) and stored directly as Cartesian tensor
-components (`delta_xx`, `delta_zz`, `beta_xx`, `beta_zz`).
+{optics_text}
 
 ![Parameter and optical tensor distributions across 1,000,000 samples](plots/dry_run_parameters.png)
 
@@ -106,18 +129,18 @@ configs:
 # Polarized Soft X-Ray Reflectivity Dataset (`reflectivity-1m`, branch `{revision}`)
 
 Synthetic polarized soft X-ray reflectivity (`s` and `p` channels) simulated with
-`refloxide` for uniaxial anisotropic thin films on native-oxide silicon:
+`refloxide` for {film_name} thin films on native-oxide silicon:
 
 ```text
-vacuum | anisotropic film | SiO2 oxide | Si substrate
+vacuum | {film_name} film | SiO2 oxide | Si substrate
 ```
 
 **Fixed-q version.** Every curve is simulated at the same photon energy
 `E = {energy_ev:.0f} eV` on the same `{n_q}`-point, evenly spaced momentum-transfer grid
 `q ∈ [{q_range[0]}, {q_range[1]}] Å⁻¹`. The `q` column is identical in every row; it is kept so
 the schema matches the `main` branch (random energy and random angles per curve).
-Models map `(R_s, R_p)` on this grid to structural and Cartesian uniaxial optical
-tensor parameters (`delta_xx`, `delta_zz`, `beta_xx`, `beta_zz`).
+Models map `(R_s, R_p)` on this grid to structural and optical parameters.
+{optics_text}
 {figures_section}
 ---
 
@@ -132,13 +155,13 @@ tensor parameters (`delta_xx`, `delta_zz`, `beta_xx`, `beta_zz`).
 | `q` | `fixed_size_list<float32>[{n_q}]` | `1/Å` | Fixed momentum transfer grid, identical in every row |
 | `s` | `fixed_size_list<float32>[{n_q}]` | power reflectance | `s`-polarized reflectivity `R_s(q)` |
 | `p` | `fixed_size_list<float32>[{n_q}]` | power reflectance | `p`-polarized reflectivity `R_p(q)` |
-| `film_thickness` | `float32` | `Å`, `[{film_thickness_range[0]}, {film_thickness_range[1]}]` | Anisotropic film thickness `t_film` |
+| `film_thickness` | `float32` | `Å`, `[{film_thickness_range[0]}, {film_thickness_range[1]}]` | Film thickness `t_film` |
 | `film_roughness` | `float32` | `Å`, `[0.0, min({film_roughness_max}, t_film / 2π)]` | Vacuum/film RMS roughness `σ_film` (Nevot–Croce capped) |
 | `oxide_thickness` | `float32` | `Å`, `[{oxide_thickness_range[0]}, {oxide_thickness_range[1]}]` | Native `SiO2` thickness `t_oxide` (`σ_oxide = t_oxide / 2π`) |
-| `delta_xx` | `float32` | `[{delta_range[0]:.1e}, {delta_range[1]:.1e}]` | In-plane (ordinary) dispersion `δ_xx = δ cos α` |
-| `delta_zz` | `float32` | `[{delta_range[0]:.1e}, {delta_range[1]:.1e}]` | Out-of-plane (extraordinary) dispersion `δ_zz = δ sin α` |
-| `beta_xx` | `float32` | `[0.0, {beta_max:.1e}]` | In-plane (ordinary) absorption `β_xx = β cos γ` |
-| `beta_zz` | `float32` | `[0.0, {beta_max:.1e}]` | Out-of-plane (extraordinary) absorption `β_zz = β sin γ` |
+| `delta_xx` | `float32` | `[{delta_range[0]:.1e}, {delta_range[1]:.1e}]` | {delta_xx_text} |
+| `delta_zz` | `float32` | `[{delta_range[0]:.1e}, {delta_range[1]:.1e}]` | {delta_zz_text} |
+| `beta_xx` | `float32` | `[0.0, {beta_max:.1e}]` | {beta_xx_text} |
+| `beta_zz` | `float32` | `[0.0, {beta_max:.1e}]` | {beta_zz_text} |
 
 ---
 

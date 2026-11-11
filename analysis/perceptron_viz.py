@@ -41,10 +41,9 @@ sys.path.insert(0, str(PROJECT_ROOT / "analysis"))
 from diagnostics import (  # noqa: E402
     FIG_DPI, INK, MUTED, SERIES, _style, block_layout, load_model, load_val_rows, unroll,
 )
+import physics  # noqa: E402
 from loss import LABEL_NAMES  # noqa: E402
 
-HC_EV_ANGSTROM = 12398.419843320026
-THETA_MAX_DEG = 64.75  # typical largest angle of a 256-point grid drawn from [0.5, 65] deg
 HERO_THICKNESS = (80.0, 300.0, 650.0)
 HERO_COLORS = (SERIES[0], SERIES[1], SERIES[2])
 
@@ -151,9 +150,9 @@ def resimulate(labels, q, energy_ev):
     return np.asarray(res.s), np.asarray(res.p)
 
 
-def estimate_energy(q_max):
-    e = float(q_max) * HC_EV_ANGSTROM / (4.0 * math.pi * math.sin(math.radians(THETA_MAX_DEG)))
-    return min(max(e, 200.0), 500.0)
+def estimate_energy(q):
+    """Photon energy [eV] of one curve; handles both random-angle and fixed-q curves."""
+    return physics.estimate_energy(float(q[0]), float(q[-1]))
 
 
 def input_to_display(model, stacked_sp):
@@ -244,7 +243,7 @@ def plot_morph(model, criterion, meta, data, path, n_rows=8192):
     for c, h in enumerate(heroes):
         ax = fig.add_subplot(gs[r, c])
         qh = q[h].numpy()
-        e = estimate_energy(qh[-1])
+        e = estimate_energy(qh)
         try:
             rs, rp = resimulate(pred_phys[h], qh, e)
             ok = True

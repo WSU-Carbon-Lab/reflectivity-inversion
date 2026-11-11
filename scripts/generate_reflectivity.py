@@ -30,9 +30,12 @@ The film is uniaxial: it has one set of optical constants in the plane of the fi
 material is n = 1 - delta + i * beta.
 
 This is the fixed-q version: every curve is measured at ENERGY_EV on the same Q_GRID.
+With --isotropic the film has a single delta and beta (delta_xx = delta_zz,
+beta_xx = beta_zz); all 7 label columns are still written so the schema stays the same.
 
 Plots live in plot_reflectivity.py and the Hugging Face upload in hf_dataset.py.
-Data is published at https://huggingface.co/datasets/carbon-lab/reflectivity-1m (branch fixed-q)
+Data is published at https://huggingface.co/datasets/carbon-lab/reflectivity-1m
+(branches fixed-q and fixed-q-isotropic).
 """
 
 import argparse
@@ -76,6 +79,11 @@ DELTA_MAGNITUDE_RANGE = (-5.0e-3, 5.0e-3)
 BETA_MAGNITUDE_RANGE = (1.0e-6, 5.0e-3)
 TENSOR_ANGLE_RANGE_DEG = (0.0, 90.0)    # 0 = all in-plane (xx), 90 = all out-of-plane (zz)
 
+# Isotropic films (--isotropic) have one delta and one beta, the same in every direction:
+# delta_xx = delta_zz = delta, drawn from DELTA_MAGNITUDE_RANGE, and
+# beta_xx = beta_zz = beta, drawn from BETA_MAGNITUDE_RANGE. TENSOR_ANGLE_RANGE_DEG is unused.
+ISOTROPIC = False
+
 # --- Substrate: native oxide on silicon ---
 OXIDE_THICKNESS_RANGE = (0.0, 15.0)     # [Å]
 OXIDE_FORMULA = "SiO2"
@@ -107,37 +115,48 @@ DRY_RUN_SAMPLES = 1_000_000     # samples streamed by --dry-run when -n is not g
 CHUNK_SIZE = 25_000             # samples simulated at once (bigger = faster, more memory)
 
 # --- Output ---
-PREVIEW_PLOT = Path("plots") / "fixed-q" / "single_sample.png"
-PLOT_DIR = Path("plots") / "fixed-q"
-DATASET_DIR = Path("data") / "reflectivity-1m-fixed-q"
+# Each dataset variant has a name: "fixed-q" (uniaxial film) or "fixed-q-isotropic".
+# Unless given on the command line, the outputs are named after it (see ``main``):
+#     plots/<variant>/                  preview and dry-run plots
+#     data/reflectivity-1m-<variant>/   Parquet files and dataset card
+#     branch <variant> of HF_REPO_ID    where the dataset is uploaded
 SHARD_SIZE = 100_000            # rows per Parquet file
 HF_REPO_ID = "carbon-lab/reflectivity-1m"
-HF_REVISION = "fixed-q"         # branch of the dataset repository to upload to
 UPLOAD = True                   # upload to Hugging Face after writing the dataset
-
-# Photon energy E [eV] times wavelength [Å] is a constant: E * lambda = h * c.
-HC_EV_ANGSTROM = 12398.41984
 
 
 def main() -> int:
     args = parse_args()
     rng = np.random.default_rng(args.seed)
 
+    # Name the outputs after the dataset variant unless they were given explicitly.
+    variant = "fixed-q-isotropic" if args.isotropic else "fixed-q"
+    if args.plot_dir is None:
+        args.plot_dir = Path("plots") / variant
+    if args.output is None:
+        args.output = args.plot_dir / "single_sample.png"
+    if args.dataset_dir is None:
+        args.dataset_dir = Path("data") / f"reflectivity-1m-{variant}"
+    if args.revision is None:
+        args.revision = variant
+
     if args.upload_only:
         return upload(args)
     if args.dry_run:
         n_samples = DRY_RUN_SAMPLES if args.num_samples is None else args.num_samples
-        run_dry_run(n_samples, rng, resolve_device(args.device), args.chunk_size, args.plot_dir)
+        run_dry_run(
+            n_samples, rng, args.isotropic, resolve_device(args.device), args.chunk_size, args.plot_dir
+        )
         return 0
     if args.num_samples is not None:
         write_dataset(
-            args.num_samples, rng, resolve_device(args.device),
-            args.chunk_size, args.shard_size, args.dataset_dir, args.plot_dir,
+            args.num_samples, rng, args.isotropic, resolve_device(args.device),
+            args.chunk_size, args.shard_size, args.dataset_dir, args.plot_dir, args.revision,
         )
         if not args.upload:
             return 0
         return upload(args)
-    run_preview(rng, args.output)
+    run_preview(rng, args.isotropic, args.output)
     return 0
 
 
@@ -146,13 +165,13 @@ def main() -> int:
 # =====================================================================================
 
 
-def run_preview(rng: np.random.Generator, output: Path) -> None:
+def run_preview(rng: np.random.Generator, isotropic: bool, output: Path) -> None:
     """Simulate one random sample, print its parameters and plot it."""
     oxide = MaterialSLD(OXIDE_FORMULA, OXIDE_DENSITY, name="oxide")
     silicon = MaterialSLD(SILICON_FORMULA, SILICON_DENSITY, name="silicon")
 
     energy_ev, q = sample_measurement(1, rng)
-    params = sample_parameters(1, rng)
+    params = sample_parameters(1, rng, isotropic)
     layers, tensors = build_stack(energy_ev, params, oxide, silicon)
     r_s, r_p = simulate_reflectivity(q, energy_ev, layers, tensors, device="cpu")
 
@@ -176,6 +195,7 @@ def run_preview(rng: np.random.Generator, output: Path) -> None:
 def run_dry_run(
     n_samples: int,
     rng: np.random.Generator,
+    isotropic: bool,
     device: str,
     chunk_size: int,
     plot_dir: Path,
@@ -195,7 +215,7 @@ def run_dry_run(
     for start in range(0, n_samples, chunk_size):
         n_chunk = min(chunk_size, n_samples - start)
         energy_ev, q = sample_measurement(n_chunk, rng)
-        params = sample_parameters(n_chunk, rng)
+        params = sample_parameters(n_chunk, rng, isotropic)
         layers, tensors = build_stack(energy_ev, params, oxide, silicon)
         r_s, r_p = simulate_reflectivity(q, energy_ev, layers, tensors, device)
 
@@ -230,11 +250,13 @@ def run_dry_run(
 def write_dataset(
     n_samples: int,
     rng: np.random.Generator,
+    isotropic: bool,
     device: str,
     chunk_size: int,
     shard_size: int,
     dataset_dir: Path,
     plot_dir: Path,
+    revision: str,
 ) -> None:
     """Simulate n_samples curves and write them to Parquet files plus a dataset card.
 
@@ -284,7 +306,7 @@ def write_dataset(
         for start in range(shard_start, shard_end, chunk_size):
             n_chunk = min(chunk_size, shard_end - start)
             energy_ev, q = sample_measurement(n_chunk, rng)
-            params = sample_parameters(n_chunk, rng)
+            params = sample_parameters(n_chunk, rng, isotropic)
             layers, tensors = build_stack(energy_ev, params, oxide, silicon)
             r_s, r_p = simulate_reflectivity(q, energy_ev, layers, tensors, device)
 
@@ -309,7 +331,8 @@ def write_dataset(
     hf_dataset.write_dataset_card(
         dataset_dir, plot_dir,
         n_samples=n_samples, n_shards=n_shards, n_q=N_Q,
-        repo_id=HF_REPO_ID, revision=HF_REVISION, q_range=Q_RANGE, energy_ev=ENERGY_EV,
+        repo_id=HF_REPO_ID, revision=revision, isotropic=isotropic,
+        q_range=Q_RANGE, energy_ev=ENERGY_EV,
         film_thickness_range=FILM_THICKNESS_RANGE, film_roughness_max=FILM_ROUGHNESS_RANGE[1],
         oxide_thickness_range=OXIDE_THICKNESS_RANGE,
         delta_range=DELTA_MAGNITUDE_RANGE, beta_max=BETA_MAGNITUDE_RANGE[1],
@@ -356,11 +379,13 @@ def sample_measurement(n: int, rng: np.random.Generator) -> tuple[FloatArray, Fl
     return energy_ev, q
 
 
-def sample_parameters(n: int, rng: np.random.Generator) -> Parameters:
+def sample_parameters(n: int, rng: np.random.Generator, isotropic: bool) -> Parameters:
     """Draw the film and oxide parameters for n samples.
 
     Thicknesses are drawn first, because each roughness is limited by its layer's
     thickness. Draws happen in a fixed order so a given seed always gives the same data.
+    With ``isotropic`` the film gets one delta and one beta (xx = zz); otherwise each
+    is drawn in polar form and split into different xx and zz parts.
     """
     film_thickness = rng.uniform(FILM_THICKNESS_RANGE[0], FILM_THICKNESS_RANGE[1], size=n)
     oxide_thickness = rng.uniform(OXIDE_THICKNESS_RANGE[0], OXIDE_THICKNESS_RANGE[1], size=n)
@@ -370,6 +395,26 @@ def sample_parameters(n: int, rng: np.random.Generator) -> Parameters:
     roughness_limit = np.clip(film_thickness / (2.0 * math.pi), roughness_min, roughness_max)
     film_roughness = rng.uniform(roughness_min, roughness_limit)
     oxide_roughness = oxide_thickness / OXIDE_THICKNESS_TO_ROUGHNESS
+
+    if isotropic:
+        delta = rng.uniform(DELTA_MAGNITUDE_RANGE[0], DELTA_MAGNITUDE_RANGE[1], size=n)
+        beta = rng.uniform(BETA_MAGNITUDE_RANGE[0], BETA_MAGNITUDE_RANGE[1], size=n)
+        return {
+            "film_thickness": film_thickness,
+            "film_roughness": film_roughness,
+            "oxide_thickness": oxide_thickness,
+            "oxide_roughness": oxide_roughness,
+            "delta_xx": delta,
+            "delta_zz": delta,
+            "beta_xx": beta,
+            "beta_zz": beta,
+            # The same values in polar form, for the dry-run plots: xx = zz is an angle
+            # of 45 deg, and magnitude * cos(45 deg) = delta gives magnitude = sqrt(2) * delta.
+            "delta_magnitude": math.sqrt(2.0) * delta,
+            "delta_angle_deg": np.full(n, 45.0),
+            "beta_magnitude": math.sqrt(2.0) * beta,
+            "beta_angle_deg": np.full(n, 45.0),
+        }
 
     # Optical constants in polar form: magnitude * (cos(angle), sin(angle)) = (xx, zz).
     delta_magnitude = rng.uniform(DELTA_MAGNITUDE_RANGE[0], DELTA_MAGNITUDE_RANGE[1], size=n)
@@ -500,20 +545,21 @@ def parse_args() -> argparse.Namespace:
     mode.add_argument("--upload-only", action="store_true", help="upload an existing --dataset-dir without generating")
 
     run = parser.add_argument_group("run")
+    run.add_argument("--isotropic", action=on_off, default=ISOTROPIC, help="isotropic film (delta_xx = delta_zz, beta_xx = beta_zz)")
     run.add_argument("--seed", type=int, default=SEED, help="random seed")
     run.add_argument("--device", choices=("auto", "cpu", "gpu"), default=DEVICE, help="where to run the simulation")
     run.add_argument("--chunk-size", type=int, default=CHUNK_SIZE, help="samples simulated at once")
 
     output = parser.add_argument_group("output")
-    output.add_argument("--output", type=Path, default=PREVIEW_PLOT, help="preview plot path")
-    output.add_argument("--plot-dir", type=Path, default=PLOT_DIR, help="folder for dry-run plots")
-    output.add_argument("--dataset-dir", type=Path, default=DATASET_DIR, help="folder for Parquet files and dataset card")
+    output.add_argument("--output", type=Path, default=None, help="preview plot path (None = <plot-dir>/single_sample.png)")
+    output.add_argument("--plot-dir", type=Path, default=None, help="folder for plots (None = plots/<variant>)")
+    output.add_argument("--dataset-dir", type=Path, default=None, help="folder for Parquet files and card (None = data/reflectivity-1m-<variant>)")
     output.add_argument("--shard-size", type=int, default=SHARD_SIZE, help="rows per Parquet file")
 
     hub = parser.add_argument_group("hugging face")
     hub.add_argument("--upload", action=on_off, default=UPLOAD, help="upload after writing the dataset")
     hub.add_argument("--repo-id", default=HF_REPO_ID, help="dataset repository")
-    hub.add_argument("--revision", default=HF_REVISION, help="branch of the repository to upload to")
+    hub.add_argument("--revision", default=None, help="branch of the repository to upload to (None = <variant>)")
     hub.add_argument("--hf-token", default=None, help="token (default: cached login or HF_TOKEN)")
     hub.add_argument("--private", action="store_true", help="create the repository as private")
     return parser.parse_args()

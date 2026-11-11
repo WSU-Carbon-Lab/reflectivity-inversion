@@ -66,10 +66,9 @@ def pick_sample_near_thickness(
     return best_idx
 
 
-def estimate_substrate_sld(q_max):
-    """Substrate optical constants (oxide_delta, oxide_beta, si_delta, si_beta) for a curve's max q."""
-    energy_ev = physics.energy_from_q_max(float(q_max))
-    energy_ev = min(max(energy_ev, physics.ENERGY_MIN_EV), physics.ENERGY_MAX_EV)
+def estimate_substrate_sld(q):
+    """Substrate optical constants (oxide_delta, oxide_beta, si_delta, si_beta) for one curve's q grid."""
+    energy_ev = physics.estimate_energy(float(q[0]), float(q[-1]))
     return physics.substrate_optical_constants(energy_ev)
 
 
@@ -375,8 +374,8 @@ class MetricStore:
         ]
         self.column_bare_flags = [False, False, ood_cases[0]["bare_oxide"], ood_cases[1]["bare_oxide"]]
         self.column_slds = [
-            estimate_substrate_sld(tr_q[-1].item()),
-            estimate_substrate_sld(val_q[-1].item()),
+            estimate_substrate_sld(tr_q),
+            estimate_substrate_sld(val_q),
             ood_cases[0]["sld"],
             ood_cases[1]["sld"],
         ]

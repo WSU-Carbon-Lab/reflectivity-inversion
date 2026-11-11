@@ -48,7 +48,7 @@ def render(ckpt_path: Path, out: Path, train_loss: float = float("nan")):
     ms.loss_name = cfg.get("loss", "profile")
     ms.column_titles = [f"Training (Row #{tr_i})", f"Validation (Row #{va_i})", ood[0]["title"], ood[1]["title"]]
     ms.column_bare_flags = [False, False, ood[0]["bare_oxide"], ood[1]["bare_oxide"]]
-    ms.column_slds = [estimate_substrate_sld(tr[2][-1].item()), estimate_substrate_sld(va[2][-1].item()),
+    ms.column_slds = [estimate_substrate_sld(tr[2]), estimate_substrate_sld(va[2]),
                       ood[0]["sld"], ood[1]["sld"]]
     ms.sample_s = torch.stack((tr[0], va[0], ood[0]["s"], ood[1]["s"]))
     ms.sample_p = torch.stack((tr[1], va[1], ood[0]["p"], ood[1]["p"]))

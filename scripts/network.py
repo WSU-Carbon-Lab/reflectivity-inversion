@@ -1,22 +1,13 @@
-"""The neural network: from three measured curves (s, p, q) to seven film parameters.
+"""The neural networks: from measured reflectivity curves to film parameters.
 
-Input, for every sample in a batch:
-    s, p  polarized X-ray reflectivity curves, 256 points each
-    q     the momentum-transfer grid those 256 points were measured at
+    ReflectivityNet  "dynamic-q" (published as Refltron). Inputs are s, p and q, so every
+                     curve may have its own q grid.
+    OldNet           "fixed-q". The original Keras network from code-old/training.py,
+                     ported to PyTorch. Input is one log-reflectivity curve on a q grid
+                     shared by every sample.
 
-Output: 7 numbers between roughly 0 and 1, one per film parameter (see
-``loss.LABEL_NAMES``). ``loss.py`` converts them back to physical units.
-
-Because q is passed in as data (not fixed), every curve may have its own q grid.
-That is why we call this the "dynamic-q" perceptron (published as Refltron).
-
-How data flows through ``ReflectivityNet``:
-
-    (s, p, q)  ->  regularize    -> (batch, 3, 256)   make the curves easier to learn from
-               ->  standardize   -> (batch, 3, 256)   zero mean, unit spread per channel
-               ->  channel mixer -> (batch, 8, 256)   mix (S, P, q) at each q point
-               ->  flatten       -> (batch, 2048)     one long vector per sample
-               ->  MLP           -> (batch, 7)        dense layers down to 7 outputs
+Both predict the film parameters scaled to [0, 1] inside their training ranges
+(see ``loss.LABEL_NAMES``). ``loss.py`` converts them back to physical units.
 """
 
 from __future__ import annotations
@@ -24,7 +15,7 @@ from __future__ import annotations
 import torch
 from torch import Tensor, nn
 
-# Ways to transform the raw reflectivity before the network sees it (see ``regularize``).
+# Ways to transform the raw reflectivity before ReflectivityNet sees it (see ``regularize``).
 REGULARIZER_CHOICES = ("log", "rq4", "log_rq4")
 
 # Activation functions: the non-linearity applied after a layer. Without one, a stack of
@@ -39,7 +30,24 @@ LOG_FLOOR = 1e-30
 
 
 class ReflectivityNet(nn.Module):
-    """Mix the (S, P, q) channels at every q point, flatten, then run a dense MLP.
+    """Dynamic-q network: (s, p, q) curves in, film parameters out.
+
+    Input, for every sample in a batch:
+        s, p  polarized reflectivity curves, n_q points each
+        q     the momentum-transfer grid those points were measured at
+
+    Because q is an input (not fixed), every curve may have its own q grid, which is
+    why this is called the "dynamic-q" perceptron (published as Refltron).
+
+    How data flows through the network:
+
+        (s, p, q) -> regularize    -> (batch, 3, n_q)       make the curves easier to learn from
+                  -> standardize   -> (batch, 3, n_q)       zero mean, unit spread per channel
+                  -> channel mixer -> (batch, 8, n_q)       mix (S, P, q) at each q point
+                  -> flatten       -> (batch, 8 * n_q)      one long vector per sample
+                  -> MLP           -> (batch, n_labels)     dense layers down to the labels
+
+    Hidden layer widths of the MLP: 400, 800, 400, 300, 200, 100.
 
     Args:
         n_q: number of points per curve.
@@ -166,3 +174,83 @@ class ReflectivityNet(nn.Module):
         x = self.prepare_inputs(s, p, q)
         mixed = self.channel_mixer(x)
         return self.mlp(mixed)
+
+
+class OldNet(nn.Module):
+    """Fixed-q network: the original Keras model of code-old, ported line for line.
+
+    Source: ``define_model`` in code-old/training.py (Greco et al.). Checked against the
+    saved code-old/trained_model.hdf5: its weights load into this class and give the
+    same outputs.
+
+    Input, for every sample in a batch:
+        one reflectivity curve on a FIXED grid of n_q q values, passed through the
+        natural log first (``prepare_old_input``). q itself is not an input: every curve
+        shares the same grid, so a number's position in the vector says which q it
+        belongs to.
+
+    Output: one number per label, scaled to [0, 1] by that label's (min, max) range.
+
+    How data flows through the network (hidden widths 400, 800, 400, 300, 200, 100):
+
+        log(R)   (batch, n_q)
+          -> Linear n_q -> 400,      ReLU
+          -> Linear 400 -> 800,      ReLU
+          -> Linear 800 -> 400,      ReLU
+          -> Linear 400 -> 300,      ReLU
+          -> Linear 300 -> 200,      ReLU
+          -> Linear 200 -> 100,      ReLU
+          -> Linear 100 -> n_labels, ReLU   (ReLU on the output too, as in the original)
+
+    Two details copied from the original so the port behaves the same:
+      - Every layer starts from the Keras defaults: Glorot (Xavier) uniform weights and
+        zero biases (see ``keras_linear``). PyTorch's own default for nn.Linear differs.
+      - The output ReLU means predictions can never go below 0. That suits labels
+        scaled to [0, 1], but an output stuck at 0 gets no gradient and stops learning.
+
+    How the original was trained (for the training script):
+        loss        mean squared error on the [0, 1]-scaled labels
+        optimizer   Adam, lr 5e-4, betas (0.9, 0.999), eps 1e-8, no weight decay
+        batches     128 rows, shuffled every epoch
+        epochs      60
+        validation  the LAST 20% of the rows (Keras' validation_split does not shuffle)
+        checkpoint  keep the weights with the lowest validation loss
+
+    Args:
+        n_q: number of q points per curve (52 in the original, 256 in the fixed-q dataset).
+        n_labels: number of labels to predict (4 in the original).
+    """
+
+    def __init__(self, n_q: int = 256, n_labels: int = 7) -> None:
+        super().__init__()
+        self.n_q = n_q
+        self.n_labels = n_labels
+        self.layers = nn.Sequential(
+            nn.Linear(n_q, 400),
+            nn.ReLU(),
+            nn.Linear(400, 800),
+            nn.ReLU(),
+            nn.Linear(800, 400),
+            nn.ReLU(),
+            nn.Linear(400, 300),
+            nn.ReLU(),
+            nn.Linear(300, 200),
+            nn.ReLU(),
+            nn.Linear(200, 100),
+            nn.ReLU(),
+            nn.Linear(100, n_labels),
+            nn.ReLU(),
+        )
+
+    def forward(self, log_reflectivity: Tensor) -> Tensor:
+        """(batch, n_q) natural-log reflectivity -> (batch, n_labels) scaled labels."""
+        return self.layers(log_reflectivity)
+
+
+
+def prepare_old_input(reflectivity: Tensor) -> Tensor:
+    """OldNet's only input transform: the natural log of the reflectivity.
+
+    The original applied ``np.log`` with no floor, so every reflectivity must be > 0.
+    """
+    return torch.log(reflectivity)

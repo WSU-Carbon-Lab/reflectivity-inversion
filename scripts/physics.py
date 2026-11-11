@@ -24,6 +24,14 @@ HC_EV_ANGSTROM = 12398.419843320026
 # from the largest q value of a curve (see ``energy_from_q_max``).
 THETA_MAX_DEG = 64.75
 
+# The fixed-q dataset (branch "fixed-q" of carbon-lab/reflectivity-1m) measures every
+# curve at one energy on one evenly spaced q grid, so its largest q says nothing about
+# the energy. We recognize that grid by its first and last q instead (see
+# ``estimate_energy``). These must match ENERGY_EV and Q_RANGE in generate_reflectivity.py.
+FIXED_Q_ENERGY_EV = 250.0
+FIXED_Q_RANGE = (0.0044, 0.184)  # first and last q [1/Å]
+FIXED_Q_TOLERANCE = 1e-6         # [1/Å]; float32 storage moves q by far less than this
+
 # Photon energies covered by the training data [eV].
 ENERGY_MIN_EV = 200.0
 ENERGY_MAX_EV = 500.0
@@ -49,6 +57,29 @@ def energy_from_q_max(q_max):
     Works on plain floats and on torch tensors.
     """
     return q_max * HC_EV_ANGSTROM / (4.0 * math.pi * math.sin(math.radians(THETA_MAX_DEG)))
+
+
+def is_fixed_q_grid(q_min, q_max):
+    """True if a curve's first and last q are those of the fixed-q grid.
+
+    Works on plain floats and, element by element, on torch tensors. A random-angle
+    curve essentially never matches both ends to within FIXED_Q_TOLERANCE.
+    """
+    first_matches = abs(q_min - FIXED_Q_RANGE[0]) < FIXED_Q_TOLERANCE
+    last_matches = abs(q_max - FIXED_Q_RANGE[1]) < FIXED_Q_TOLERANCE
+    return first_matches & last_matches
+
+
+def estimate_energy(q_min, q_max):
+    """Photon energy [eV] of one curve from its first and last q [1/Å] (plain floats).
+
+    Fixed-q curves get FIXED_Q_ENERGY_EV. Every other curve uses ``energy_from_q_max``,
+    clamped to the training range [ENERGY_MIN_EV, ENERGY_MAX_EV].
+    """
+    if is_fixed_q_grid(q_min, q_max):
+        return FIXED_Q_ENERGY_EV
+    energy_ev = energy_from_q_max(q_max)
+    return min(max(energy_ev, ENERGY_MIN_EV), ENERGY_MAX_EV)
 
 
 def substrate_optical_constants(energy_ev):

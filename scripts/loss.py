@@ -156,12 +156,16 @@ class DepthProfileLoss(LabelMSELoss):
         return torch.cat((lengths, physical[:, 3:]), dim=1)
 
     def lookup_substrate(self, q: Tensor) -> Tensor:
-        """Estimate each curve's photon energy from its largest q and look up the substrate.
+        """Estimate each curve's photon energy from its q grid and look up the substrate.
 
+        Same rule as ``physics.estimate_energy``: curves on the fixed-q grid use its fixed
+        energy; all others are estimated from their largest q.
         Returns shape (batch, 4): (oxide_delta, oxide_beta, silicon_delta, silicon_beta).
         """
         energy = physics.energy_from_q_max(q[:, -1])
         energy = energy.clamp(physics.ENERGY_MIN_EV, physics.ENERGY_MAX_EV)
+        fixed = physics.is_fixed_q_grid(q[:, 0], q[:, -1])
+        energy = torch.where(fixed, torch.full_like(energy, physics.FIXED_Q_ENERGY_EV), energy)
         row = (energy - physics.ENERGY_MIN_EV).round().long()
         return self.substrate_table[row]
 
