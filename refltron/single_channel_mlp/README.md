@@ -10,7 +10,7 @@ When you have read this, `HOWTO.md` in the same folder walks you through writing
 model yourself from a blank file.
 
 Before you start, work through the setup in the top-level `README.md` (installing `uv`,
-logging in to Weights & Biases and Hugging Face, downloading the data).
+logging in to Hugging Face, downloading the data; a W&B login is optional because we train locally).
 
 ## The problem
 
@@ -204,8 +204,9 @@ labels. Early snapshots show predictions sitting at the middle of every range; b
 the bars should match.
 
 The same numbers go to Weights & Biases under the keys `train/loss`, `val/loss`,
-`val/mae_<label>` and so on, so you can compare runs in the browser. With `--local` the
-run is recorded offline and you sync it later with `wandb sync`.
+`val/mae_<label>` and so on, so you can compare runs in the browser. `--local` is the
+default here: the run is recorded offline under `./wandb/`, needs no login, and you can
+sync it later with `wandb sync`. `--no-local` sends it to the hosted server (login needed).
 
 ## Things to try
 

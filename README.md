@@ -12,8 +12,8 @@ out-of-plane optical constants (delta_xx, delta_zz, beta_xx, beta_zz).
 
 ## Getting set up
 
-Everything below is done once. If you already have `uv`, a Hugging Face account and a
-W&B login, skip to step 4.
+Everything below is done once. If you already have `uv` and a Hugging Face account,
+skip to step 4. A W&B login is optional: we train locally.
 
 ### 1. Install uv
 
@@ -46,17 +46,22 @@ without you having to activate it.
 
 ### 3. Accounts and logins
 
-**Weights & Biases** records the loss and the figures of every training run so you can
-compare runs in a browser. Our runs go to a hosted W&B instance, not the public one, so
-the login needs the host:
+**Weights & Biases (optional, skip it if you train locally).** We train locally, so you
+do not need a W&B account or login. Pass `--local` to a training script (it is already the
+default for the single-channel one; the multi-channel one needs the flag, or set `LOCAL = True`
+at the top of its `train.py`). W&B then runs in offline mode: it writes everything under
+`./wandb/` and never contacts a server. You can still `wandb sync` those runs later.
+
+If you do want your runs in the browser, they go to a hosted W&B instance, not the public
+one, so the login needs the host:
 
 ```bash
 uv run wandb login --host https://api.forge.coreweave.com
 ```
 
 It will ask for an API key, which you get from that site once you have been added to the
-`als-rixs` team. Ask Harlan to add you. If you only want to try things locally, every
-training script has a `--local` flag that keeps W&B offline; nothing needs a login then.
+`als-rixs` team. Ask Harlan to add you. Without a login, always train with `--local`; without that flag
+the script starts W&B online and asks for credentials.
 
 **Hugging Face** hosts the training data and the trained models under the `carbon-lab`
 organization, which is private. Three steps:

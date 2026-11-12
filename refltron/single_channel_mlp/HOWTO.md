@@ -352,7 +352,7 @@ Then `main` uses `args.epochs` instead of `EPOCHS` and so on. Now
 
 ## Step 10: log to Weights & Biases
 
-Once you have a W&B login (top-level README), three lines turn the print statements into
+You do not need a W&B login for this (we train locally, so the run stays offline). Three lines turn the print statements into
 a dashboard you can compare across runs:
 
 ```python

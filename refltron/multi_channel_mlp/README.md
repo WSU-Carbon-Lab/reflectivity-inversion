@@ -99,10 +99,14 @@ different losses can still be compared.
 
 ```bash
 uv run python -m refltron.multi_channel_mlp.train --epochs 5 --max-samples 50000 --local   # smoke test
-uv run python -m refltron.multi_channel_mlp.train                                            # the full run, 600 epochs
-uv run python -m refltron.multi_channel_mlp.train --resume checkpoints/<run>/best.pt         # continue a stopped run
+uv run python -m refltron.multi_channel_mlp.train --local                                    # the full run, 600 epochs
+uv run python -m refltron.multi_channel_mlp.train --resume checkpoints/<run>/best.pt --local # continue a stopped run
 uv run python -m refltron.multi_channel_mlp.train --help
 ```
+
+`--local` keeps W&B offline, so no login is needed. Without it the script starts W&B
+online and asks for credentials, so always pass it when training locally (or set
+`LOCAL = True` at the top of `train.py`).
 
 The defaults at the top of `train.py` are the best published configuration, `v2-relu-log`.
 Compared to the single-channel recipe:
