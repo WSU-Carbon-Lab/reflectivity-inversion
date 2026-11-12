@@ -229,9 +229,13 @@ def split_dataset(dataset, val_split):
     """Use the first rows for training and the last ``val_split`` fraction for validation.
 
     The rows are already in random order, so the split is random too, but always
-    the same, which keeps runs comparable.
+    the same, which keeps runs comparable. With val_split = 0 (for example when
+    over-fitting a single row on purpose) the training rows are also used to validate.
     """
     n_val = int(len(dataset) * val_split)
+    if n_val == 0:
+        everything = Subset(dataset, range(len(dataset)))
+        return everything, everything
     n_train = len(dataset) - n_val
     return Subset(dataset, range(n_train)), Subset(dataset, range(n_train, len(dataset)))
 

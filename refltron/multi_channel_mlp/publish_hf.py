@@ -1,8 +1,8 @@
 """Publish trained runs to the Hugging Face Hub as versions (branches) of one model repo.
 
-    uv run --with safetensors python -m refltron.multi_channel_mlp.publish_hf --dry-run   # stage only
-    uv run --with safetensors python -m refltron.multi_channel_mlp.publish_hf             # stage + upload
-    uv run --with safetensors python -m refltron.multi_channel_mlp.publish_hf --help      # list every option
+    uv run python -m refltron.multi_channel_mlp.publish_hf --dry-run   # stage only
+    uv run python -m refltron.multi_channel_mlp.publish_hf             # stage + upload
+    uv run python -m refltron.multi_channel_mlp.publish_hf --help      # list every option
 
 Each version gets its own branch holding weights, config, training log, diagnostics and
 figures. ``main`` holds the overview card and the cross-version comparison.

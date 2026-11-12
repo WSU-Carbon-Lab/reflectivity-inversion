@@ -1,8 +1,8 @@
 """Add the single-channel fixed-q models to the Refltron model card on the Hugging Face Hub.
 
-    uv run --with safetensors python -m refltron.single_channel_mlp.publish_hf --dry-run   # figures + stage only
-    uv run --with safetensors python -m refltron.single_channel_mlp.publish_hf             # stage + upload
-    uv run --with safetensors python -m refltron.single_channel_mlp.publish_hf --help      # list every option
+    uv run python -m refltron.single_channel_mlp.publish_hf --dry-run   # figures + stage only
+    uv run python -m refltron.single_channel_mlp.publish_hf             # stage + upload
+    uv run python -m refltron.single_channel_mlp.publish_hf --help      # list every option
 
 The Refltron (multi-channel) part of the ``main`` card is left exactly as it is on the
 Hub. This script only adds a section at the bottom, between two marker comments, and

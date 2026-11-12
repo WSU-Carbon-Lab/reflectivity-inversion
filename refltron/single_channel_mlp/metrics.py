@@ -12,7 +12,9 @@ multi-channel MLP's MetricStore. Each epoch it
         2. the depth profile the predicted labels describe, against the truth,
         3. the labels, normalized to the training range.
 At the end, ``finish`` reloads the best weights and reports each label's MAE, RMSE and
-R^2 on the validation rows (W&B summary + metrics.json).
+R^2 on the validation rows (W&B summary + metrics.json), and saves the two standard
+end-of-training figures next to them: ``loss_curves.png`` and ``parity.png``
+(see refltron/common/training_plots.py).
 """
 
 import json
@@ -26,15 +28,16 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
-import wandb
 from torch.utils.data import DataLoader
 
+import wandb
 from refltron.common import physics
 from refltron.common import plot_style as ps
 from refltron.common.depth_profile import estimate_substrate_sld
 from refltron.common.loss import DepthProfileLoss, expand_to_all_labels, label_range
 from refltron.common.snapshot_plots import plot_depth_profile_panel, plot_label_bars
 from refltron.common.tracking import WANDB_BASE_URL, WANDB_ENTITY, WANDB_PROJECT
+from refltron.common.training_plots import plot_loss_curves, plot_parity
 
 ps.apply()  # shared figure style (colours, fonts, hairline grid)
 
@@ -161,6 +164,8 @@ class MetricStore:
 
         self.best_val_loss = math.inf
         self.saved_checkpoints = []
+        # One entry per epoch, for the loss-curve figure drawn by finish().
+        self.history = []
 
     def to_profile_labels(self, normalized):
         """Scaled network outputs or targets -> all 7 physical labels (for depth profiles)."""
@@ -199,6 +204,12 @@ class MetricStore:
         for i in range(len(self.label_names)):
             metrics[f"val/mae_{self.label_names[i]}"] = val_mae[i].item()
         self.run.log(metrics, step=epoch)
+        self.history.append({
+            "epoch": epoch,
+            "train_loss": train_loss,
+            "val_loss": val_loss,
+            "thickness_mae": val_mae[0].item(),
+        })
 
         print(
             f"Epoch {epoch:3d}/{self.epochs} | train(mse) {train_loss:.2e} | val {val_loss:.2e} | "
@@ -303,11 +314,12 @@ class MetricStore:
 
     @torch.no_grad()
     def finish(self):
-        """Reload the best weights, report each label's validation errors, and close the run."""
+        """Reload the best weights, report each label's validation errors, draw the final figures, close the run."""
         best = torch.load(self.ckpt_dir / "best.pt", map_location=self.device, weights_only=False)
         self.model.load_state_dict(best["model_state_dict"])
         self.model.eval()
 
+        # Predict every validation row with the best weights, in physical units.
         predictions = []
         targets = []
         for x, y in DataLoader(self.val_set, batch_size=8192):
@@ -315,31 +327,42 @@ class MetricStore:
             targets.append(y)
         scale = torch.tensor(self.label_max - self.label_min, dtype=torch.float64)
         offset = torch.tensor(self.label_min, dtype=torch.float64)
-        predicted = torch.cat(predictions).double() * scale + offset
-        true = torch.cat(targets).double() * scale + offset
+        predicted = (torch.cat(predictions).double() * scale + offset).numpy()
+        true = (torch.cat(targets).double() * scale + offset).numpy()
 
-        # R^2 = 1 - (mean squared error) / (variance of the truth): 1 is perfect, 0 is no
-        # better than always guessing the average.
-        report = {"best_epoch": best["epoch"], "best_val_loss": best["val_loss"], "labels": {}}
+        # 1. Loss curves: training and validation loss per epoch.
+        loss_fig = self.ckpt_dir / "loss_curves.png"
+        plot_loss_curves(
+            self.history, loss_fig, loss_name="MSE",
+            title=f"Single-channel MLP · input {self.input_name} · {len(self.history)} epochs",
+        )
+
+        # 2. Parity plots: predicted vs true for every label, with MAE / RMSE / R^2.
+        parity_fig = self.ckpt_dir / "parity.png"
+        errors = plot_parity(
+            true, predicted, self.label_names, parity_fig,
+            title=f"Single-channel MLP · input {self.input_name} · best epoch {best['epoch']} · validation rows",
+        )
+
+        # 3. Write the numbers to the terminal, W&B and metrics.json.
+        report = {"best_epoch": best["epoch"], "best_val_loss": best["val_loss"], "labels": errors}
         print(f"\nBest epoch {best['epoch']} (val loss {best['val_loss']:.5f}). Validation errors:")
-        for i in range(len(self.label_names)):
-            name = self.label_names[i]
-            error = predicted[:, i] - true[:, i]
-            mae = error.abs().mean().item()
-            rmse = error.pow(2).mean().sqrt().item()
-            r2 = (1.0 - error.pow(2).mean() / true[:, i].var()).item()
-            report["labels"][name] = {"mae": mae, "rmse": rmse, "r2": r2}
-            self.run.summary[f"best/{name}/mae"] = mae
-            self.run.summary[f"best/{name}/rmse"] = rmse
-            self.run.summary[f"best/{name}/r2"] = r2
-            print(f"  {name:16s} MAE {mae:.4g}   RMSE {rmse:.4g}   R^2 {r2:+.3f}")
+        for name in self.label_names:
+            e = errors[name]
+            self.run.summary[f"best/{name}/mae"] = e["mae"]
+            self.run.summary[f"best/{name}/rmse"] = e["rmse"]
+            self.run.summary[f"best/{name}/r2"] = e["r2"]
+            print(f"  {name:16s} MAE {e['mae']:.4g}   RMSE {e['rmse']:.4g}   R^2 {e['r2']:+.3f}")
         self.run.summary["best/epoch"] = best["epoch"]
         self.run.summary["best/val_loss"] = best["val_loss"]
         with open(self.ckpt_dir / "metrics.json", "w") as file:
             json.dump(report, file, indent=2)
+        self.run.log({"final/loss_curves": wandb.Image(str(loss_fig)), "final/parity": wandb.Image(str(parity_fig))},
+                     step=self.epochs)
 
         best_fig = self.ckpt_dir / "best.png"
         if not self.local and best_fig.is_file():
             self._upload_artifact(self.ckpt_dir / "best.pt", best_fig, alias="best")
         self.run.finish()
         print(f"Best validation loss: {self.best_val_loss:.2e} (saved in {self.ckpt_dir})")
+        print(f"Figures: {loss_fig} and {parity_fig}")

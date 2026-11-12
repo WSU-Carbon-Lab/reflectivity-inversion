@@ -27,6 +27,10 @@ ACTIVATION_CHOICES = tuple(ACTIVATIONS)
 # Reflectivity can be exactly 0 in a simulation; log10(0) is -infinity, so we clamp to this first.
 LOG_FLOOR = 1e-30
 
+# Planck constant times speed of light [eV·Å]: wavelength [Å] = HC_EV_ANGSTROM / energy [eV].
+# (Same value as refltron.common.physics; repeated here so this file only needs torch.)
+HC_EV_ANGSTROM = 12398.419843320026
+
 
 class ReflectivityNet(nn.Module):
     """Variable-q network: (s, p, q) curves in, film parameters out.
@@ -173,3 +177,68 @@ class ReflectivityNet(nn.Module):
         x = self.prepare_inputs(s, p, q)
         mixed = self.channel_mixer(x)
         return self.mlp(mixed)
+
+
+class ReflectivityNetEmbed(nn.Module):
+    """Variable-q network with an embedding: (s, p, q, energy) in, film parameters out.
+
+    Instead of stacking (S, P, q) as three channels and mixing them into 8 (as
+    ReflectivityNet does), ReflectivityEmbed turns each q point into ONE number that
+    starts as the anisotropy ratio A. The MLP then reads n_q numbers, like the
+    single-channel model.
+
+    How data flows through the network:
+
+        (s, p, q, energy) -> embed   -> (batch, n_q)        one value per q point, starts as A
+                          -> MLP     -> (batch, n_labels)   dense layers down to the labels
+
+    Hidden layer widths of the MLP: 400, 800, 400, 300, 200, 100, the same as
+    ReflectivityNet so the two can be compared. (Like ReflectivityNet, the first two
+    Linear layers have no activation between them.)
+
+    Args:
+        n_q: number of points per curve.
+        n_labels: number of film parameters to predict.
+        embed_hidden: width of the embedding's correction layer.
+        activation: ``"relu"`` or ``"gelu"``.
+    """
+
+    def __init__(
+        self,
+        n_q: int = 256,
+        n_labels: int = 7,
+        embed_hidden: int = 16,
+        activation: str = "relu",
+    ) -> None:
+        super().__init__()
+        if activation not in ACTIVATIONS:
+            raise ValueError(f"Unknown activation {activation!r}; choose from {ACTIVATION_CHOICES}")
+        self.activation = activation
+        Activation = ACTIVATIONS[activation]
+
+        # --- Embedding: (s, p, q, energy) -> one value per q point ----------------------
+        self.embed = ReflectivityEmbed(hidden=embed_hidden, activation=activation)
+
+        # --- Multi-layer perceptron (MLP) ----------------------------------------------
+        self.mlp = nn.Sequential(
+            nn.Linear(n_q, 400),
+            nn.Linear(400, 800),
+            Activation(),
+            nn.Linear(800, 400),
+            Activation(),
+            nn.Linear(400, 300),
+            Activation(),
+            nn.Linear(300, 200),
+            Activation(),
+            nn.Linear(200, 100),
+            Activation(),
+            nn.Linear(100, n_labels),  # no activation: outputs are not clipped to [0, 1]
+        )
+
+        # Start the output biases at 0.5, the middle of the normalized label range.
+        nn.init.constant_(self.mlp[-1].bias, 0.5)
+
+    def forward(self, s: Tensor, p: Tensor, q: Tensor, energy: Tensor) -> Tensor:
+        """Predict normalized film parameters, shape (batch, n_labels)."""
+        embedded = self.embed(s, p, q, energy)
+        return self.mlp(embedded)
