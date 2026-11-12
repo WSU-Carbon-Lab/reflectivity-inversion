@@ -2,7 +2,7 @@
 
 Neural networks that turn polarized X-ray reflectivity curves into thin-film parameters.
 
-The current model, **Refltron**, reads the s- and p-polarized reflectivity of a sample
+The main model, **Refltron** (the multi-channel MLP), reads the s- and p-polarized reflectivity of a sample
 (vacuum | organic film | SiO2 | Si) together with its q grid, and predicts seven numbers:
 the film thickness and roughness, the oxide thickness, and the film's in-plane and
 out-of-plane optical constants (delta_xx, delta_zz, beta_xx, beta_zz).
@@ -13,39 +13,30 @@ out-of-plane optical constants (delta_xx, delta_zz, beta_xx, beta_zz).
 ## Quick start
 
 ```bash
-uv sync                                                        # install dependencies
-uv run python scripts/train.py --epochs 5 --max-samples 50000 --local   # short test run
-uv run python scripts/train.py                                 # full run with the defaults
+uv sync                                                              # install dependencies
+uv run python -m refltron.multi_channel_mlp.train --epochs 5 --max-samples 50000 --local   # short test run
+uv run python -m refltron.multi_channel_mlp.train                    # full Refltron run
+uv run python -m refltron.single_channel_mlp.train --input s         # original single-channel MLP
 ```
 
-All training settings are listed as `CAPITALIZED` defaults at the top of
-`scripts/train.py`: edit them there, or override any one with a command-line flag
-(`uv run python scripts/train.py --help` lists them).
+Run everything from the project folder with `python -m`. Every model folder has the same three files, `network.py`, `train.py` and `metrics.py`, and every
+training script has the same main loop. Each script lists its settings
+as `CAPITALIZED` defaults at the top: edit them there, or override any one with a
+command-line flag (`--help` lists them).
 
 ## Where things are
 
-The core, in reading order:
+All code lives in the `refltron/` package, one folder per piece:
 
-| file | what it does |
+| folder | what it holds |
 |---|---|
-| `scripts/network.py` | the network: input transform, channel mixer, dense layers |
-| `scripts/loss.py` | the losses: label MSE, depth-profile distance, and the hybrid of both |
-| `scripts/train.py` | loads the data, builds everything, runs the training loop |
-| `scripts/metrics.py` | logging to W&B, checkpoints, and per-checkpoint snapshot figures |
-| `scripts/physics.py` | shared physical constants and the SiO2 / Si substrate model |
+| `refltron/common/` | shared by every model: `physics.py` (constants, SiO2 / Si substrate, fixed-q energy), `loss.py` (label names and ranges, MSE / depth-profile / hybrid losses), `depth_profile.py` and `snapshot_plots.py` (depth profiles and the panels every snapshot figure shares), `plot_style.py`, `tracking.py` (W&B settings), `paths.py` |
+| `refltron/dataset/` | `generate_reflectivity.py` simulates and uploads the reflectivity-1m datasets (fixed-q / variable-q, uniaxial / isotropic); `hf_dataset.py` writes the dataset card and uploads; `plot_reflectivity.py` draws preview and distribution plots |
+| `refltron/multi_channel_mlp/` | Refltron: `network.py` (ReflectivityNet), `train.py`, `metrics.py` (W&B logging, checkpoints, snapshot figures), `render_snapshot.py`, `publish_hf.py` |
+| `refltron/multi_channel_mlp/analysis/` | `diagnostics.py`, `perceptron_viz.py`, `activations.py`, `compare_runs.py`, `eval_versions.py`, `hub_figures.py` |
+| `refltron/single_channel_mlp/` | the original 2019 Keras MLP in PyTorch: `network.py` (OldNet), `train.py` (log S -> 5 labels, log P -> 7, anisotropy ratio -> 7, on the fixed-q datasets), `metrics.py` (W&B logging, checkpoints, snapshot figures, final per-label errors), `publish_hf.py` (card section, figures and one Hub branch per model) |
 
-Tools:
-
-| file | what it does |
-|---|---|
-| `scripts/generate_reflectivity.py` | simulates the training dataset and uploads it |
-| `scripts/render_snapshot.py` | redraws a checkpoint's snapshot figure |
-| `scripts/publish_hf.py` | publishes trained runs to `carbon-lab/refltron` |
-| `analysis/diagnostics.py` | layer-by-layer health checks for every checkpoint |
-| `analysis/perceptron_viz.py` | how a curve morphs through the layers, plus one card per layer |
-| `analysis/compare_runs.py` | side-by-side comparison of training runs |
-
-Generated (not tracked by git): `data/`, `checkpoints/`, `wandb/`, `logs/`, `analysis/runs/`.
+Generated (not tracked by git): `data/`, `checkpoints/`, `wandb/`, `logs/`, `plots/`, `analysis/runs/`.
 
 ## Original 2019 code
 

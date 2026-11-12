@@ -37,8 +37,10 @@ ENERGY_MIN_EV = 200.0
 ENERGY_MAX_EV = 500.0
 
 # Substrate materials: chemical formula and mass density [g/cm^3].
-OXIDE_FORMULA, OXIDE_DENSITY = "SiO2", 2.2
-SILICON_FORMULA, SILICON_DENSITY = "Si", 2.33
+OXIDE_FORMULA = "SiO2"
+OXIDE_DENSITY = 2.2
+SILICON_FORMULA = "Si"
+SILICON_DENSITY = 2.33
 
 # Roughness of the oxide | silicon interface [Å]. The oxide's own (top) roughness is
 # tied to its thickness: sigma_oxide = oxide_thickness / (2 pi).
@@ -67,6 +69,8 @@ def is_fixed_q_grid(q_min, q_max):
     """
     first_matches = abs(q_min - FIXED_Q_RANGE[0]) < FIXED_Q_TOLERANCE
     last_matches = abs(q_max - FIXED_Q_RANGE[1]) < FIXED_Q_TOLERANCE
+    # "&" means "and". We use it instead of the word "and" because it also works on
+    # torch tensors, where it compares every curve of a batch separately.
     return first_matches & last_matches
 
 
@@ -88,9 +92,11 @@ def substrate_optical_constants(energy_ev):
     The refractive index of each material is n = 1 - delta + i * beta.
     """
     energies = np.array([float(energy_ev)])
+    # tensor_at_many gives one 3x3 optical tensor per energy; [0, 0, 0] is the first
+    # energy's xx component (the same in every direction for these isotropic materials).
     oxide = MaterialSLD(OXIDE_FORMULA, OXIDE_DENSITY).tensor_at_many(energies)[0, 0, 0]
     silicon = MaterialSLD(SILICON_FORMULA, SILICON_DENSITY).tensor_at_many(energies)[0, 0, 0]
-    return float(oxide.real), float(oxide.imag), float(silicon.real), float(silicon.imag)
+    return (float(oxide.real), float(oxide.imag), float(silicon.real), float(silicon.imag))
 
 
 def substrate_optical_table(energies_ev):

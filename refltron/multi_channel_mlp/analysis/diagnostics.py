@@ -17,8 +17,8 @@ is fundamentally off:
   * Input saliency vs q index   -> which parts of the curves the network actually reads
 
 Usage:
-    uv run python analysis/diagnostics.py --all              # every run in checkpoints/
-    uv run python analysis/diagnostics.py --checkpoint checkpoints/<run>/best.pt
+    uv run python -m refltron.multi_channel_mlp.analysis.diagnostics --all              # every run in checkpoints/
+    uv run python -m refltron.multi_channel_mlp.analysis.diagnostics --checkpoint checkpoints/<run>/best.pt
 """
 
 from __future__ import annotations
@@ -38,12 +38,10 @@ import polars as pl
 import torch
 from torch import nn
 
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(PROJECT_ROOT / "scripts"))
-sys.path.insert(0, str(PROJECT_ROOT / "analysis"))
 
-from loss import LABEL_NAMES, DepthProfileLoss, build_loss  # noqa: E402
-from network import ReflectivityNet  # noqa: E402
+from refltron.common.loss import LABEL_NAMES, DepthProfileLoss, build_loss
+from refltron.common.paths import PROJECT_ROOT
+from refltron.multi_channel_mlp.network import ReflectivityNet
 
 # Rows 900,000+ (the last shard) are the validation split for every run trained with
 # the default --val-split 0.10 on the full 1M dataset, so none were seen in training.
@@ -87,14 +85,30 @@ FLAG = {
 def load_model(ckpt_path: Path):
     """Rebuild the exact architecture saved in a checkpoint (ReLU or GELU, any ReLU layout)."""
     ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
-    cfg = ckpt.get("config", {}) or {}
+    cfg = ckpt.get("config")
+    if not cfg:
+        cfg = {}
     sd = ckpt["model_state_dict"]
-    activation = cfg.get("activation") or ("gelu" if cfg.get("model") == "netg" else "relu")
-    act_cls = nn.GELU if activation == "gelu" else nn.ReLU
+
+    # Older checkpoints did not store the activation; "netg" was the GELU model.
+    activation = cfg.get("activation")
+    if not activation:
+        if cfg.get("model") == "netg":
+            activation = "gelu"
+        else:
+            activation = "relu"
+    if activation == "gelu":
+        act_cls = nn.GELU
+    else:
+        act_cls = nn.ReLU
 
     # Checkpoints saved before --regularizer / --loss existed used log_rq4 + label MSE.
-    regularizer = cfg.get("regularizer") or "log_rq4"
-    loss_name = cfg.get("loss") or "mse"
+    regularizer = cfg.get("regularizer")
+    if not regularizer:
+        regularizer = "log_rq4"
+    loss_name = cfg.get("loss")
+    if not loss_name:
+        loss_name = "mse"
     normalize = "input_mean" in sd
 
     model = ReflectivityNet(
@@ -105,23 +119,35 @@ def load_model(ckpt_path: Path):
     model.channel_mixer = nn.Sequential(
         nn.Conv1d(conv_w.size(1), conv_w.size(0), kernel_size=1), act_cls(), nn.Flatten(1)
     )
-    # Any mlp index without a weight was a parameter-free activation when saved.
-    idxs = sorted(int(k.split(".")[1]) for k in sd if k.startswith("mlp.") and k.endswith(".weight"))
-    modules = []
-    for i in range(idxs[-1] + 1):
+
+    # Rebuild the MLP layer by layer. Every saved "mlp.<i>.weight" is a Linear layer;
+    # any index in between without a weight was a parameter-free activation.
+    last_index = 0
+    for key in sd:
+        if key.startswith("mlp.") and key.endswith(".weight"):
+            index = int(key.split(".")[1])
+            if index > last_index:
+                last_index = index
+    model.mlp = nn.Sequential()
+    for i in range(last_index + 1):
         w = sd.get(f"mlp.{i}.weight")
-        modules.append(nn.Linear(w.shape[1], w.shape[0]) if w is not None else act_cls())
-    model.mlp = nn.Sequential(*modules)
+        if w is not None:
+            model.mlp.append(nn.Linear(w.shape[1], w.shape[0]))
+        else:
+            model.mlp.append(act_cls())
     model.load_state_dict(sd)
     model.eval()
 
+    model_name = cfg.get("model")
+    if not model_name:
+        model_name = "net"
     meta = {
         "run": ckpt_path.parent.name,
         "checkpoint": ckpt_path.name,
         "epoch": int(ckpt.get("epoch", -1)),
         "val_loss": float(ckpt.get("val_loss", float("nan"))),
         "planned_epochs": cfg.get("epochs"),
-        "model": cfg.get("model") or "net",
+        "model": model_name,
         "activation": act_cls.__name__,
         "normalize_inputs": normalize,
         "lr_schedule": cfg.get("lr_schedule", "constant"),
@@ -152,13 +178,20 @@ def load_val_rows(n: int):
 def block_layout(model):
     """Group modules into (linear op, activation or None) blocks in forward order."""
     seq = list(model.channel_mixer) + list(model.mlp)
-    blocks, i = [], 0
+    blocks = []
+    i = 0
     while i < len(seq):
         m = seq[i]
         if isinstance(m, (nn.Linear, nn.Conv1d)):
-            act = seq[i + 1] if i + 1 < len(seq) and isinstance(seq[i + 1], ACTIVATIONS) else None
+            # A linear op owns the activation right after it, if there is one.
+            act = None
+            if i + 1 < len(seq) and isinstance(seq[i + 1], ACTIVATIONS):
+                act = seq[i + 1]
             blocks.append((m, act))
-            i += 2 if act is not None else 1
+            if act is not None:
+                i += 2
+            else:
+                i += 1
         else:
             i += 1
     return blocks
@@ -175,11 +208,17 @@ def unroll(model, s, p, q):
     x = model.prepare_inputs(s, p, q)
     stacked = x
     out = []
-    for idx, (op, act) in enumerate(block_layout(model)):
+    blocks = block_layout(model)
+    for idx in range(len(blocks)):
+        op = blocks[idx][0]
+        act = blocks[idx][1]
         if isinstance(op, nn.Linear) and x.dim() == 3:
             x = x.flatten(1)
         pre = op(x)
-        post = act(pre) if act is not None else pre
+        if act is not None:
+            post = act(pre)
+        else:
+            post = pre
         out.append(
             {"name": block_name(op, idx), "op": op, "act": act, "input": x, "pre": pre, "post": post}
         )
@@ -189,7 +228,10 @@ def unroll(model, s, p, q):
 
 def as_units(t):
     """View activations as (samples, units); Conv1d channels are treated per q index."""
-    return t.permute(0, 2, 1).reshape(-1, t.size(1)) if t.dim() == 3 else t
+    if t.dim() == 3:
+        # (batch, channels, n_q) -> (batch * n_q, channels): every q point counts as a sample.
+        return t.permute(0, 2, 1).reshape(-1, t.size(1))
+    return t
 
 
 # --------------------------------------------------------------------------------------
@@ -219,31 +261,44 @@ def redundancy(feats: np.ndarray, live: np.ndarray):
     if f.shape[1] < 2:
         return 0.0
     c = np.corrcoef(f, rowvar=False)
+    # Every unit pair once: the entries above the diagonal of the correlation matrix.
     iu = np.triu_indices_from(c, k=1)
     return float((np.abs(c[iu]) > 0.95).mean())
 
 
 def ridge_probe(feats: np.ndarray, y: np.ndarray, splits):
     """Linear-probe R^2 per label: fit ridge on train, pick lambda on val, score on test."""
-    tr, va, te = splits
-    mu, sd = feats[tr].mean(0), feats[tr].std(0) + 1e-6
+    tr = splits[0]
+    va = splits[1]
+    te = splits[2]
+    mu = feats[tr].mean(0)
+    sd = feats[tr].std(0) + 1e-6
     X = (feats - mu) / sd
-    X = np.concatenate([X, np.ones((len(X), 1))], 1)
+    X = np.concatenate([X, np.ones((len(X), 1))], 1)  # extra column of ones = bias term
     ym = y[tr].mean(0)
     Y = y - ym
 
     # Solve in whichever space is smaller (features or samples).
-    Xtr, Ytr = X[tr], Y[tr]
+    Xtr = X[tr]
+    Ytr = Y[tr]
     use_dual = Xtr.shape[1] > Xtr.shape[0]
-    G = Xtr @ Xtr.T if use_dual else Xtr.T @ Xtr
+    if use_dual:
+        G = Xtr @ Xtr.T
+    else:
+        G = Xtr.T @ Xtr
     scale = np.trace(G) / G.shape[0]
-    best, best_err = None, np.inf
+    best = None
+    best_err = np.inf
     for lam in (1e-4, 1e-3, 1e-2, 1e-1, 1.0):
         reg = G + lam * scale * np.eye(G.shape[0])
-        W = Xtr.T @ np.linalg.solve(reg, Ytr) if use_dual else np.linalg.solve(reg, Xtr.T @ Ytr)
+        if use_dual:
+            W = Xtr.T @ np.linalg.solve(reg, Ytr)
+        else:
+            W = np.linalg.solve(reg, Xtr.T @ Ytr)
         err = ((X[va] @ W - Y[va]) ** 2).mean()
         if err < best_err:
-            best, best_err = W, err
+            best = W
+            best_err = err
     pred = X[te] @ best
     ss_res = ((pred - Y[te]) ** 2).sum(0)
     ss_tot = ((Y[te] - Y[te].mean(0)) ** 2).sum(0) + 1e-12
@@ -268,8 +323,9 @@ def chained_linear_rank(blocks):
     """Detect consecutive linear ops with no activation between them (they collapse to one)."""
     chains = []
     for i in range(len(blocks) - 1):
-        op, act = blocks[i]
-        nxt, _ = blocks[i + 1]
+        op = blocks[i][0]
+        act = blocks[i][1]
+        nxt = blocks[i + 1][0]
         if act is None and isinstance(op, nn.Linear) and isinstance(nxt, nn.Linear):
             prod = (nxt.weight @ op.weight).detach().double()
             sv = torch.linalg.svdvals(prod).numpy()
@@ -277,7 +333,7 @@ def chained_linear_rank(blocks):
                 {
                     "blocks": [block_name(op, i), block_name(nxt, i + 1)],
                     "composite_shape": list(prod.shape),
-                    "rank_bound": int(min(op.weight.shape[0], *prod.shape)),
+                    "rank_bound": int(min(op.weight.shape[0], prod.shape[0], prod.shape[1])),
                     "numerical_rank": int((sv > sv[0] * 1e-3).sum()),
                     "wide_layer_width": int(nxt.weight.shape[0]),
                 }
@@ -291,7 +347,9 @@ def gradient_flow(model, criterion, s, p, q, y):
     loss = criterion(model(s, p, q), y, q)
     loss.backward()
     rows = []
-    for idx, (op, _) in enumerate(block_layout(model)):
+    blocks = block_layout(model)
+    for idx in range(len(blocks)):
+        op = blocks[idx][0]
         g = op.weight.grad.norm().item()
         w = op.weight.norm().item()
         rows.append({"name": block_name(op, idx), "grad_norm": g, "grad_to_weight": g / (w + 1e-12)})
@@ -308,7 +366,9 @@ def input_saliency(model, s, p, q):
     out = model.mlp(model.channel_mixer(x))
     sal = []
     for k in range(out.size(1)):
-        (g,) = torch.autograd.grad(out[:, k].sum(), x, retain_graph=True)
+        # Gradient of output k (summed over rows) with respect to every input value.
+        gradients = torch.autograd.grad(out[:, k].sum(), x, retain_graph=True)
+        g = gradients[0]
         sal.append((g.abs() * x_std).mean(0))
     return torch.stack(sal).numpy()
 
@@ -322,7 +382,8 @@ def mixer_analysis(model, stacked):
     var = contrib.var(0)  # (mix, 3)
     frac = (var / var.sum(1, keepdim=True).clamp_min(1e-12)).numpy()
     # Polarization sensitivity: S-P difference relative to S+P common mode.
-    ws, wp = w[:, 0], w[:, 1]
+    ws = w[:, 0]
+    wp = w[:, 1]
     anis = ((ws - wp).abs() / ((ws + wp).abs() + (ws - wp).abs() + 1e-12)).numpy()
     return {
         "weights": w.numpy().tolist(),
@@ -346,14 +407,31 @@ def layer_metrics(stacked, blocks, y_norm, splits):
         in_rms = b["input"].pow(2).mean().sqrt().item()
         post_rms = b["post"].pow(2).mean().sqrt().item()
         active = (pre_u > 0).float()
-        frac_active = active.mean(0).numpy()
+        frac_active = active.mean(0).numpy()  # fraction of samples on which each unit fires
         has_act = b["act"] is not None
         post_np = post_u.numpy()
-        live = frac_active > 0 if has_act else np.ones_like(frac_active, bool)
 
+        # Unit-usage numbers only mean something for blocks followed by an activation.
+        if has_act:
+            live = frac_active > 0
+            activation_name = type(b["act"]).__name__
+            sparsity = float(1.0 - active.mean().item())
+            dead_frac = float((frac_active == 0).mean())
+            rare_frac = float(((frac_active > 0) & (frac_active < 0.01)).mean())
+            always_on_frac = float((frac_active > 0.99).mean())
+        else:
+            live = np.ones_like(frac_active, bool)
+            activation_name = None
+            sparsity = 0.0
+            dead_frac = 0.0
+            rare_frac = 0.0
+            always_on_frac = 1.0
+
+        # Share of the layer's variance carried by its top 1% most variable units.
         unit_var = post_u.var(0).numpy()
         top = max(1, int(round(0.01 * len(unit_var))))
-        var_top1 = float(np.sort(unit_var)[::-1][:top].sum() / max(unit_var.sum(), 1e-12))
+        largest_first = np.sort(unit_var)[::-1]
+        var_top1 = float(largest_first[:top].sum() / max(unit_var.sum(), 1e-12))
 
         # Effective rank on per-sample feature vectors (flattened for the conv mixer).
         feats = b["post"].flatten(1).numpy()
@@ -363,16 +441,16 @@ def layer_metrics(stacked, blocks, y_norm, splits):
                 "name": b["name"],
                 "width": int(feats.shape[1]),
                 "has_activation": has_act,
-                "activation": type(b["act"]).__name__ if has_act else None,
+                "activation": activation_name,
                 "in_rms": in_rms,
                 "pre_rms": b["pre"].pow(2).mean().sqrt().item(),
                 "post_rms": post_rms,
                 "gain": post_rms / (in_rms + 1e-12),
                 "spike_ratio": b["post"].abs().max().item() / (post_rms + 1e-12),
-                "sparsity": float(1.0 - active.mean().item()) if has_act else 0.0,
-                "dead_frac": float((frac_active == 0).mean()) if has_act else 0.0,
-                "rare_frac": float(((frac_active > 0) & (frac_active < 0.01)).mean()) if has_act else 0.0,
-                "always_on_frac": float((frac_active > 0.99).mean()) if has_act else 1.0,
+                "sparsity": sparsity,
+                "dead_frac": dead_frac,
+                "rare_frac": rare_frac,
+                "always_on_frac": always_on_frac,
                 "var_top1pct_units": var_top1,
                 "eff_rank": pr,
                 "eff_rank_frac": pr / feats.shape[1],
@@ -405,12 +483,17 @@ def raise_flags(m):
             flags.append(f"{n}: spike ratio {L['spike_ratio']:.0f} (max |a| / RMS) -> a few units carry outsized values")
         if L["redundant_frac"] > FLAG["redundant_frac"]:
             flags.append(f"{n}: {100*L['redundant_frac']:.0f}% of live unit pairs are near-duplicates (|r| > 0.95)")
-    prev_name, prev = "input", np.mean(m["probe_input"])
+
+    # Linear-probe R^2 should not drop much from one stage to the next.
+    prev_name = "input"
+    prev = np.mean(m["probe_input"])
     for L in m["layers"]:
         cur = np.mean(L["probe_r2"])
         if prev - cur > FLAG["probe_drop"]:
             flags.append(f"{L['name']}: linear-probe mean R^2 drops {prev:.3f} -> {cur:.3f} vs {prev_name} (information lost or entangled)")
-        prev_name, prev = L["name"], cur
+        prev_name = L["name"]
+        prev = cur
+
     for c in m["linear_chains"]:
         flags.append(
             f"{c['blocks'][0]} and {c['blocks'][1]} have no activation between them: they collapse to one "
@@ -418,9 +501,14 @@ def raise_flags(m):
             f"(numerical rank {c['numerical_rank']}); the {c['wide_layer_width']}-wide layer can only carry a "
             f"{c['rank_bound']}-dim signal and the pair is no more expressive than a single linear layer"
         )
-    ratios = [g["grad_to_weight"] for g in m["gradient_flow"] if g["grad_to_weight"] > 0]
-    if ratios and max(ratios) / min(ratios) > FLAG["grad_spread"]:
+
+    ratios = []
+    for g in m["gradient_flow"]:
+        if g["grad_to_weight"] > 0:
+            ratios.append(g["grad_to_weight"])
+    if len(ratios) > 0 and max(ratios) / min(ratios) > FLAG["grad_spread"]:
         flags.append(f"gradient/weight ratio spans {max(ratios)/min(ratios):.0f}x across layers -> uneven learning speed")
+
     sal = np.array(m["saliency"]).sum(0)  # (3, n_q)
     ch_tot = sal.sum(1)
     if ch_tot[2] > 0.5 * ch_tot.sum():
@@ -439,6 +527,7 @@ def analyze(ckpt_path: Path, data, n_sal: int, n_grad: int):
     model, criterion, meta = load_model(ckpt_path)
     s, p, q, y = data
     n = len(y)
+    # Split the rows 60 / 20 / 20 into probe-training, probe-validation and probe-test rows.
     rng = np.random.default_rng(0)
     perm = rng.permutation(n)
     splits = (perm[: int(0.6 * n)], perm[int(0.6 * n) : int(0.8 * n)], perm[int(0.8 * n) :])
@@ -457,22 +546,26 @@ def analyze(ckpt_path: Path, data, n_sal: int, n_grad: int):
     # Output-layer probe on the actual prediction (not refit) for comparison.
     out_r2 = 1 - ((out - y_norm) ** 2).sum(0) / ((y_norm - y_norm.mean(0)) ** 2).sum(0)
 
-    m = {
-        **meta,
-        "n_rows": n,
-        "val_metrics": val_metrics,
-        "output_r2_per_label": out_r2.tolist(),
-        "probe_input": probe_in,
-        "input_eff_rank": effective_rank(stacked.flatten(1).numpy())[0],
-        "layers": layers,
-        "weights": [
-            {"name": block_name(op, i), **weight_stats(op)} for i, (op, _) in enumerate(block_layout(model))
-        ],
-        "linear_chains": chained_linear_rank(block_layout(model)),
-        "gradient_flow": gradient_flow(model, criterion, s[:n_grad], p[:n_grad], q[:n_grad], y[:n_grad]),
-        "saliency": input_saliency(model, s[:n_sal], p[:n_sal], q[:n_sal]).tolist(),
-        "mixer": mixer_analysis(model, stacked),
-    }
+    weights = []
+    layout = block_layout(model)
+    for i in range(len(layout)):
+        op = layout[i][0]
+        entry = {"name": block_name(op, i)}
+        entry.update(weight_stats(op))
+        weights.append(entry)
+
+    m = dict(meta)  # start from the checkpoint description, then add the measurements
+    m["n_rows"] = n
+    m["val_metrics"] = val_metrics
+    m["output_r2_per_label"] = out_r2.tolist()
+    m["probe_input"] = probe_in
+    m["input_eff_rank"] = effective_rank(stacked.flatten(1).numpy())[0]
+    m["layers"] = layers
+    m["weights"] = weights
+    m["linear_chains"] = chained_linear_rank(layout)
+    m["gradient_flow"] = gradient_flow(model, criterion, s[:n_grad], p[:n_grad], q[:n_grad], y[:n_grad])
+    m["saliency"] = input_saliency(model, s[:n_sal], p[:n_sal], q[:n_sal]).tolist()
+    m["mixer"] = mixer_analysis(model, stacked)
     m["flags"] = raise_flags(m)
     return m
 
@@ -492,44 +585,70 @@ def _style(ax, title):
 
 def plot_layer_health(m, path):
     L = m["layers"]
-    names = [l["name"] for l in L]
+    names = []
+    for layer in L:
+        names.append(layer["name"])
     x = np.arange(len(L))
     fig, axes = plt.subplots(2, 3, figsize=(17, 9), layout="constrained")
 
     ax = axes[0, 0]
     w = 0.26
-    ax.bar(x - w, [100 * l["dead_frac"] for l in L], w, color=SERIES[1], label="dead (never fires)")
-    ax.bar(x, [100 * l["sparsity"] for l in L], w, color=SERIES[0], label="mean sparsity")
-    ax.bar(x + w, [100 * (l["always_on_frac"] if l["has_activation"] else np.nan) for l in L], w, color=SERIES[3], label="always on (~linear)")
-    for i, l in enumerate(L):
-        if not l["has_activation"]:
+    dead = []
+    sparsity = []
+    always_on = []
+    for layer in L:
+        dead.append(100 * layer["dead_frac"])
+        sparsity.append(100 * layer["sparsity"])
+        if layer["has_activation"]:
+            always_on.append(100 * layer["always_on_frac"])
+        else:
+            always_on.append(100 * np.nan)  # no bar: "always on" is meaningless without an activation
+    ax.bar(x - w, dead, w, color=SERIES[1], label="dead (never fires)")
+    ax.bar(x, sparsity, w, color=SERIES[0], label="mean sparsity")
+    ax.bar(x + w, always_on, w, color=SERIES[3], label="always on (~linear)")
+    for i in range(len(L)):
+        if not L[i]["has_activation"]:
             ax.text(i, 3, "no act.", ha="center", fontsize=10, color=MUTED, rotation=90)
     ax.set_ylabel("% of units")
     ax.legend(fontsize=10.5, frameon=False)
     _style(ax, "Unit usage")
 
     ax = axes[0, 1]
-    ax.plot(x, [l["gain"] for l in L], "-o", color=SERIES[0], lw=2, ms=6, label="gain (RMS out / in)")
-    ax.plot(x, [l["spike_ratio"] / 10 for l in L], "-s", color=SERIES[1], lw=2, ms=6, label="spike ratio / 10")
+    gains = []
+    spikes = []
+    for layer in L:
+        gains.append(layer["gain"])
+        spikes.append(layer["spike_ratio"] / 10)
+    ax.plot(x, gains, "-o", color=SERIES[0], lw=2, ms=6, label="gain (RMS out / in)")
+    ax.plot(x, spikes, "-s", color=SERIES[1], lw=2, ms=6, label="spike ratio / 10")
     ax.axhline(1, color=MUTED, ls=":", lw=1)
     ax.set_yscale("log")
     ax.legend(fontsize=10.5, frameon=False)
     _style(ax, "Signal intensification per block")
 
     ax = axes[0, 2]
-    ax.plot(x, [100 * l["eff_rank_frac"] for l in L], "-o", color=SERIES[2], lw=2, ms=6, label="eff. rank / width")
-    ax.plot(x, [100 * l["redundant_frac"] for l in L], "-s", color=SERIES[4], lw=2, ms=6, label="near-duplicate unit pairs")
-    for i, l in enumerate(L):
-        ax.annotate(f"{l['eff_rank']:.0f}", (i, 100 * l["eff_rank_frac"]), textcoords="offset points", xytext=(0, 6), ha="center", fontsize=10, color=INK)
+    rank_fracs = []
+    redundant = []
+    for layer in L:
+        rank_fracs.append(100 * layer["eff_rank_frac"])
+        redundant.append(100 * layer["redundant_frac"])
+    ax.plot(x, rank_fracs, "-o", color=SERIES[2], lw=2, ms=6, label="eff. rank / width")
+    ax.plot(x, redundant, "-s", color=SERIES[4], lw=2, ms=6, label="near-duplicate unit pairs")
+    for i in range(len(L)):
+        ax.annotate(f"{L[i]['eff_rank']:.0f}", (i, 100 * L[i]["eff_rank_frac"]), textcoords="offset points",
+                    xytext=(0, 6), ha="center", fontsize=10, color=INK)
     ax.set_ylabel("%")
     ax.legend(fontsize=10.5, frameon=False)
     _style(ax, "Rank & redundancy (numbers = participation ratio)")
 
     ax = axes[1, 0]
-    probes = np.array([m["probe_input"]] + [l["probe_r2"] for l in L])  # (stages, 7)
+    probe_rows = [m["probe_input"]]
+    for layer in L:
+        probe_rows.append(layer["probe_r2"])
+    probes = np.array(probe_rows)  # (stages, 7)
     xs = np.arange(len(probes))
-    for k, lab in enumerate(LABEL_NAMES):
-        ax.plot(xs, probes[:, k], "-o", color=SERIES[k], lw=2, ms=4, label=lab)
+    for k in range(len(LABEL_NAMES)):
+        ax.plot(xs, probes[:, k], "-o", color=SERIES[k], lw=2, ms=4, label=LABEL_NAMES[k])
     ax.plot(xs, probes.mean(1), color=INK, lw=2.5, ls="--", label="mean")
     ax.set_xticks(xs, ["input"] + names, rotation=35, ha="right", fontsize=10)
     ax.set_ylim(min(0, probes.min()) - 0.02, 1.02)
@@ -539,16 +658,23 @@ def plot_layer_health(m, path):
 
     ax = axes[1, 1]
     g = m["gradient_flow"]
-    ax.bar(np.arange(len(g)), [r["grad_to_weight"] for r in g], color=SERIES[0], width=0.6)
+    ratios = []
+    grad_names = []
+    for row in g:
+        ratios.append(row["grad_to_weight"])
+        grad_names.append(row["name"])
+    ax.bar(np.arange(len(g)), ratios, color=SERIES[0], width=0.6)
     ax.set_yscale("log")
-    ax.set_xticks(np.arange(len(g)), [r["name"] for r in g], rotation=35, ha="right", fontsize=10)
+    ax.set_xticks(np.arange(len(g)), grad_names, rotation=35, ha="right", fontsize=10)
     ax.set_ylabel("‖∇W‖ / ‖W‖")
     _style(ax, f"Gradient flow (one batch, loss={m['loss']})")
 
     ax = axes[1, 2]
-    for i, wst in enumerate(m["weights"]):
+    for i in range(len(m["weights"])):
+        wst = m["weights"][i]
         sv = np.array(wst["singular_values"])
-        ax.plot(np.linspace(0, 1, len(sv)), sv / sv[0], color=SERIES[i % len(SERIES)], lw=1.8, label=f"{wst['name']} (stable rank {wst['stable_rank']:.1f})")
+        ax.plot(np.linspace(0, 1, len(sv)), sv / sv[0], color=SERIES[i % len(SERIES)], lw=1.8,
+                label=f"{wst['name']} (stable rank {wst['stable_rank']:.1f})")
     ax.set_yscale("log")
     ax.set_xlabel("singular value index (fraction of max rank)")
     ax.set_ylabel("σ / σ_max")
@@ -571,6 +697,7 @@ def plot_saliency(m, path):
     sal = np.array(m["saliency"])  # (7, 3, n_q)
     n_q = sal.shape[2]
     fig, axes = plt.subplots(2, 2, figsize=(16, 9), layout="constrained", gridspec_kw={"width_ratios": [2.2, 1]})
+    channel_colors = [SERIES[0], SERIES[1], SERIES[2]]
 
     ax = axes[0, 0]
     norm = sal[:, :2].sum(1)
@@ -583,8 +710,9 @@ def plot_saliency(m, path):
 
     ax = axes[1, 0]
     tot = sal.sum(0)
-    for c, (lab, col) in enumerate(zip(("S channel", "P channel", "raw q channel"), (SERIES[0], SERIES[1], SERIES[2]))):
-        ax.plot(np.arange(n_q), tot[c], color=col, lw=2, label=lab)
+    channel_names = ["S channel", "P channel", "raw q channel"]
+    for c in range(3):
+        ax.plot(np.arange(n_q), tot[c], color=channel_colors[c], lw=2, label=channel_names[c])
     ax.set_xlabel("q index (0 .. 255)")
     ax.set_ylabel("Σ_labels mean |∂y/∂x|")
     ax.legend(fontsize=10.5, frameon=False)
@@ -594,11 +722,16 @@ def plot_saliency(m, path):
     frac = np.array(m["mixer"]["variance_frac_S_P_q"])
     mix = np.arange(frac.shape[0])
     bottom = np.zeros(len(mix))
-    for c, (lab, col) in enumerate(zip(("S", "P", "q"), (SERIES[0], SERIES[1], SERIES[2]))):
-        ax.bar(mix, frac[:, c], bottom=bottom, color=col, width=0.65, label=lab, edgecolor="white", linewidth=1)
-        bottom += frac[:, c]
-    alive = [m["layers"][0]["unit_frac_active"][i] for i in mix]
-    ax.set_xticks(mix, [f"ch{i}\n{100*a:.0f}% on" for i, a in enumerate(alive)], fontsize=10)
+    short_names = ["S", "P", "q"]
+    for c in range(3):
+        ax.bar(mix, frac[:, c], bottom=bottom, color=channel_colors[c], width=0.65, label=short_names[c],
+               edgecolor="white", linewidth=1)
+        bottom += frac[:, c]  # stack the next channel on top
+    tick_labels = []
+    for i in mix:
+        alive = m["layers"][0]["unit_frac_active"][i]
+        tick_labels.append(f"ch{i}\n{100*alive:.0f}% on")
+    ax.set_xticks(mix, tick_labels, fontsize=10)
     ax.set_ylabel("share of pre-activation variance")
     ax.legend(fontsize=10.5, frameon=False, ncol=3)
     _style(ax, "Mixer: what each channel listens to")
@@ -606,7 +739,10 @@ def plot_saliency(m, path):
     ax = axes[1, 1]
     ax.bar(mix, m["mixer"]["polarization_contrast"], color=SERIES[4], width=0.65)
     ax.set_ylim(0, 1)
-    ax.set_xticks(mix, [f"ch{i}" for i in mix], fontsize=10.5)
+    channel_ticks = []
+    for i in mix:
+        channel_ticks.append(f"ch{i}")
+    ax.set_xticks(mix, channel_ticks, fontsize=10.5)
     ax.set_ylabel("|w_S − w_P| / (|w_S + w_P| + |w_S − w_P|)")
     _style(ax, "Mixer S/P contrast (0 = sum, 1 = difference)")
 
@@ -615,43 +751,70 @@ def plot_saliency(m, path):
     plt.close(fig)
 
 
+def checkpoint_epoch(m):
+    """The epoch a diagnostics result belongs to (used to sort results by epoch)."""
+    return m["epoch"]
+
+
 def plot_evolution(ms, path):
     """Track layer health across the periodic checkpoints of one run."""
-    ms = sorted([m for m in ms if m["checkpoint"] != "best.pt"], key=lambda m: m["epoch"])
-    if len(ms) < 2:
+    periodic = []
+    for m in ms:
+        if m["checkpoint"] != "best.pt":
+            periodic.append(m)
+    periodic.sort(key=checkpoint_epoch)
+    if len(periodic) < 2:
         return
-    names = [l["name"] for l in ms[0]["layers"]]
-    epochs = [m["epoch"] for m in ms]
+    names = []
+    for layer in periodic[0]["layers"]:
+        names.append(layer["name"])
+    epochs = []
+    for m in periodic:
+        epochs.append(m["epoch"])
+
     fig, axes = plt.subplots(1, 3, figsize=(17, 4.8), layout="constrained")
-    for metric, ax, title, scale in (
-        ("dead_frac", axes[0], "Dead units (%)", 100),
-        ("eff_rank_frac", axes[1], "Effective rank / width (%)", 100),
-        ("gain", axes[2], "Gain (RMS out / in)", 1),
-    ):
-        for i, n in enumerate(names):
-            ax.plot(epochs, [scale * m["layers"][i][metric] for m in ms], "-o", color=SERIES[i % len(SERIES)], lw=2, ms=5, label=n)
+    metric_keys = ["dead_frac", "eff_rank_frac", "gain"]
+    titles = ["Dead units (%)", "Effective rank / width (%)", "Gain (RMS out / in)"]
+    scales = [100, 100, 1]
+    for j in range(3):
+        ax = axes[j]
+        for i in range(len(names)):
+            values = []
+            for m in periodic:
+                values.append(scales[j] * m["layers"][i][metric_keys[j]])
+            ax.plot(epochs, values, "-o", color=SERIES[i % len(SERIES)], lw=2, ms=5, label=names[i])
         ax.set_xlabel("epoch")
-        _style(ax, title)
+        _style(ax, titles[j])
     axes[2].set_yscale("log")
     axes[0].legend(fontsize=9.5, frameon=False)
-    fig.suptitle(f"Layer health over training — {ms[0]['run']}", fontsize=14.5, color=INK)
+    fig.suptitle(f"Layer health over training — {periodic[0]['run']}", fontsize=14.5, color=INK)
     fig.savefig(path, dpi=FIG_DPI)
     plt.close(fig)
 
 
 def plot_summary(best, path):
     fig, axes = plt.subplots(1, 3, figsize=(18, 5.2), layout="constrained")
-    for i, m in enumerate(best):
+    for i in range(len(best)):
+        m = best[i]
         col = SERIES[i % len(SERIES)]
         lab = f"{m['run']} ({m['loss']}, {m['regularizer']})"
-        stages = ["input"] + [l["name"].split(" ")[0] for l in m["layers"]]
+        stages = ["input"]
+        probe_means = [np.mean(m["probe_input"])]
+        dead = []
+        ranks = []
+        for layer in m["layers"]:
+            stages.append(layer["name"].split(" ")[0])
+            probe_means.append(np.mean(layer["probe_r2"]))
+            dead.append(100 * layer["dead_frac"])
+            ranks.append(layer["eff_rank"])
         xs = np.arange(len(stages))
-        axes[0].plot(xs, [np.mean(m["probe_input"])] + [np.mean(l["probe_r2"]) for l in m["layers"]], "-o", color=col, lw=2, ms=5, label=lab)
-        axes[1].plot(xs[1:], [100 * l["dead_frac"] for l in m["layers"]], "-o", color=col, lw=2, ms=5, label=lab)
-        axes[2].plot(xs[1:], [l["eff_rank"] for l in m["layers"]], "-o", color=col, lw=2, ms=5, label=lab)
-    for ax, t in zip(axes, ("Mean linear-probe R²", "Dead units (%)", "Effective rank (participation ratio)")):
-        ax.set_xticks(xs, stages, fontsize=10.5)
-        _style(ax, t)
+        axes[0].plot(xs, probe_means, "-o", color=col, lw=2, ms=5, label=lab)
+        axes[1].plot(xs[1:], dead, "-o", color=col, lw=2, ms=5, label=lab)
+        axes[2].plot(xs[1:], ranks, "-o", color=col, lw=2, ms=5, label=lab)
+    titles = ["Mean linear-probe R²", "Dead units (%)", "Effective rank (participation ratio)"]
+    for j in range(3):
+        axes[j].set_xticks(xs, stages, fontsize=10.5)
+        _style(axes[j], titles[j])
     axes[2].set_yscale("log")
     axes[0].legend(fontsize=10, frameon=False)
     fig.suptitle("All runs — best.pt", fontsize=14.5, color=INK)
@@ -665,6 +828,7 @@ def plot_summary(best, path):
 
 
 def run_status(run_dir: Path):
+    """(finished?, last saved epoch, planned epochs) of a run folder."""
     ckpts = sorted(run_dir.glob("*.pt"))
     planned = None
     last = 0
@@ -687,9 +851,17 @@ def write_summary(best, statuses, path):
     lines.append("|---|---|---|---|---|---|---|---|---|---|---|")
     for m in best:
         st = statuses[m["run"]]
-        status = "complete" if st[0] else f"stopped ({st[1]}/{st[2]})" if st[1] else f"no periodic ckpt (planned {st[2]})"
+        if st[0]:
+            status = "complete"
+        elif st[1]:
+            status = f"stopped ({st[1]}/{st[2]})"
+        else:
+            status = f"no periodic ckpt (planned {st[2]})"
         vm = m["val_metrics"]
-        dead = max(100 * l["dead_frac"] for l in m["layers"])
+        dead_values = []
+        for layer in m["layers"]:
+            dead_values.append(100 * layer["dead_frac"])
+        dead = max(dead_values)
         pr_in = np.mean(m["probe_input"])
         pr_last = np.mean(m["layers"][-2]["probe_r2"])
         lines.append(
@@ -703,15 +875,22 @@ def write_summary(best, statuses, path):
         lines.append("|---|---|---|---|---|---|---|---|---|---|")
         lines.append(f"| input | {768} | – | – | – | – | – | {m['input_eff_rank']:.1f} | – | {np.mean(m['probe_input']):.3f} / {m['probe_input'][0]:.3f} |")
         for l in m["layers"]:
-            act = l["has_activation"]
+            # A star marks numbers that are meaningless because no activation follows the block.
+            if l["has_activation"]:
+                marker = ""
+            else:
+                marker = "*"
             lines.append(
-                f"| {l['name']} | {l['width']} | {100*l['dead_frac']:.1f}" + ("" if act else "*") +
-                f" | {100*l['always_on_frac']:.1f}" + ("" if act else "*") +
+                f"| {l['name']} | {l['width']} | {100*l['dead_frac']:.1f}" + marker +
+                f" | {100*l['always_on_frac']:.1f}" + marker +
                 f" | {100*l['sparsity']:.1f} | {l['gain']:.2f} | {l['spike_ratio']:.1f} | {l['eff_rank']:.1f} / {l['n99']} | "
                 f"{100*l['redundant_frac']:.1f} | {np.mean(l['probe_r2']):.3f} / {l['probe_r2'][0]:.3f} |"
             )
         lines.append("\n(* = no activation after this block)\n")
-        lines.append("Flags:" if m["flags"] else "Flags: none")
+        if m["flags"]:
+            lines.append("Flags:")
+        else:
+            lines.append("Flags: none")
         for f in m["flags"]:
             lines.append(f"- {f}")
         lines.append("")
@@ -719,8 +898,11 @@ def write_summary(best, statuses, path):
 
 
 def checkpoints_for(run_dir: Path, every: bool):
+    """best.pt of a run, plus its numbered epoch_*.pt checkpoints if ``every``."""
+    out = []
     best = run_dir / "best.pt"
-    out = [best] if best.exists() else []
+    if best.exists():
+        out.append(best)
     if every:
         out += sorted(run_dir.glob("epoch_*.pt"))
     return out
@@ -747,24 +929,24 @@ def main():
     torch.set_grad_enabled(True)
     print(f"Loading {args.n_rows} validation rows from {VAL_SHARD.name} ...")
     data = load_val_rows(args.n_rows)
-    _viz_cache = {}
+    viz_rows = None  # 8192 rows for the perceptron figures, loaded the first time they are needed
 
-    def viz_data():
-        if "d" not in _viz_cache:
-            _viz_cache["d"] = load_val_rows(8192)
-        return _viz_cache["d"]
-
+    # Which checkpoints to analyze, grouped by run folder: {run folder: [checkpoint paths]}.
+    run_dirs = {}
     if args.checkpoint:
-        run_dirs = {args.checkpoint.parent: [args.checkpoint]}
+        run_dirs[args.checkpoint.parent] = [args.checkpoint]
     else:
-        run_dirs = {
-            d: checkpoints_for(d, not args.best_only)
-            for d in sorted((PROJECT_ROOT / "checkpoints").iterdir())
-            if d.is_dir() and (d / "best.pt").exists() and (not args.runs or d.name in args.runs)
-        }
+        for d in sorted((PROJECT_ROOT / "checkpoints").iterdir()):
+            if not d.is_dir() or not (d / "best.pt").exists():
+                continue
+            if args.runs and d.name not in args.runs:
+                continue
+            run_dirs[d] = checkpoints_for(d, not args.best_only)
 
-    statuses, best_metrics = {}, []
-    for run_dir, ckpts in run_dirs.items():
+    statuses = {}
+    best_metrics = []
+    for run_dir in run_dirs:
+        ckpts = run_dirs[run_dir]
         statuses[run_dir.name] = run_status(run_dir)
         if args.completed_only and not statuses[run_dir.name][0]:
             print(f"skip {run_dir.name}: incomplete {statuses[run_dir.name]}")
@@ -786,14 +968,16 @@ def main():
                 plot_saliency(m, run_out / f"{tag}_saliency.png")
                 if (tag == "best" or ck == ckpts[-1]) and not args.no_unroll:
                     # Standardized perceptron figures: curve morph + per-layer cards.
-                    from perceptron_viz import render_all
-                    m["morph"] = render_all(ck, viz_data(), run_out, tag)
+                    from refltron.multi_channel_mlp.analysis.perceptron_viz import render_all
+                    if viz_rows is None:
+                        viz_rows = load_val_rows(8192)
+                    m["morph"] = render_all(ck, viz_rows, run_out, tag)
                     jpath.write_text(json.dumps(m))
                 if tag == "best" and args.legacy_unroll:
                     subprocess.run(
-                        [sys.executable, str(PROJECT_ROOT / "analysis/activations.py"), "--checkpoint", str(ck),
+                        [sys.executable, "-m", "refltron.multi_channel_mlp.analysis.activations", "--checkpoint", str(ck),
                          "--out-dir", str(run_out), "--include-ood"],
-                        check=False, stdout=subprocess.DEVNULL,
+                        check=False, stdout=subprocess.DEVNULL, cwd=PROJECT_ROOT,
                     )
             run_ms.append(m)
             if tag == "best":

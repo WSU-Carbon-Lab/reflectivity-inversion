@@ -1,10 +1,10 @@
 """Generate simulated polarized soft X-ray reflectivity curves for training.
 
-    uv run python scripts/generate_reflectivity.py                   # preview one random sample
-    uv run python scripts/generate_reflectivity.py --dry-run         # distribution plots, nothing saved
-    uv run python scripts/generate_reflectivity.py -n 1000000        # write the dataset + upload it
-    uv run python scripts/generate_reflectivity.py -n 1000 --no-upload   # small local dataset
-    uv run python scripts/generate_reflectivity.py --help            # list every option
+    uv run python -m refltron.dataset.generate_reflectivity                   # preview one random sample
+    uv run python -m refltron.dataset.generate_reflectivity --dry-run         # distribution plots, nothing saved
+    uv run python -m refltron.dataset.generate_reflectivity -n 1000000        # write the dataset + upload it
+    uv run python -m refltron.dataset.generate_reflectivity -n 1000 --no-upload   # small local dataset
+    uv run python -m refltron.dataset.generate_reflectivity --help            # list every option
 
 Every option has a default in the DEFAULT SETTINGS block. Edit a value there to change
 it permanently, or pass the matching command-line flag to change it for one run.
@@ -14,8 +14,9 @@ Each simulated sample is a stack of four layers, from top to bottom:
     vacuum | film | native SiO2 oxide | Si substrate
 
 How one batch of samples is made:
-    1. Measurement: every sample uses the same photon energy and the same grid of
-       N_Q momentum-transfer values q (``sample_measurement``).
+    1. Measurement: where along q each curve is measured (``sample_measurement``).
+       Fixed-q: every sample uses the same photon energy and the same q grid.
+       Variable-q (--no-fixed-q): every sample gets a random energy and random angles.
     2. Sample: pick the film thickness, roughness and optical constants, plus the
        oxide thickness (``sample_parameters``).
     3. Stack: put every layer's numbers into the arrays the simulator reads
@@ -29,13 +30,18 @@ The film is uniaxial: it has one set of optical constants in the plane of the fi
 (``delta_xx``, ``delta_zz``, ``beta_xx``, ``beta_zz``). The refractive index of a
 material is n = 1 - delta + i * beta.
 
-This is the fixed-q version: every curve is measured at ENERGY_EV on the same Q_GRID.
 With --isotropic the film has a single delta and beta (delta_xx = delta_zz,
 beta_xx = beta_zz); all 7 label columns are still written so the schema stays the same.
 
+The two switches give four dataset variants, each on its own branch of
+https://huggingface.co/datasets/carbon-lab/reflectivity-1m :
+
+    --fixed-q     uniaxial film   branch fixed-q
+    --fixed-q     --isotropic     branch fixed-q-isotropic
+    --no-fixed-q  uniaxial film   branch main   (the original dataset)
+    --no-fixed-q  --isotropic     branch variable-q-isotropic
+
 Plots live in plot_reflectivity.py and the Hugging Face upload in hf_dataset.py.
-Data is published at https://huggingface.co/datasets/carbon-lab/reflectivity-1m
-(branches fixed-q and fixed-q-isotropic).
 """
 
 import argparse
@@ -51,8 +57,7 @@ from numpy.typing import NDArray
 from refloxide import tmm
 from refloxide.model import MaterialSLD
 
-import hf_dataset
-import plot_reflectivity
+from refltron.dataset import hf_dataset, plot_reflectivity
 
 # Type aliases used throughout: a numpy array of float64 values, and a dictionary
 # that maps a parameter name (e.g. "film_thickness") to one value per sample.
@@ -64,13 +69,23 @@ Parameters = dict[str, FloatArray]
 # =====================================================================================
 
 # --- Measurement: where the reflectivity is "measured" ---
-# Every sample uses the same photon energy and the same evenly spaced q grid.
-# Q_RANGE spans q(0.5 deg, 500 eV) to q(65 deg, 200 eV): the range the earlier
-# random-energy dataset could reach at every energy. At 250 eV it is theta ~0.2-46 deg.
+N_Q = 256                           # q points per curve
+FIXED_Q = True                      # True = fixed-q, False = variable-q (--fixed-q / --no-fixed-q)
+
+# Fixed-q: every sample uses the same photon energy and the same evenly spaced q grid.
+# Q_RANGE spans q(0.5 deg, 500 eV) to q(65 deg, 200 eV): the range the variable-q
+# data can reach at every energy. At 250 eV it is theta ~1.0-46.6 deg.
 ENERGY_EV = 250.0                   # photon energy [eV]
 Q_RANGE = (0.0044, 0.184)           # first and last q of the grid [1/Å]
-N_Q = 256                           # q points per curve
 Q_GRID = np.linspace(Q_RANGE[0], Q_RANGE[1], N_Q)
+
+# Variable-q: every sample gets its own random energy and N_Q random grazing angles,
+# converted to q. This mimics a real angle scan at an arbitrary photon energy.
+ENERGY_RANGE_EV = (200.0, 500.0)    # photon energy [eV]
+THETA_RANGE_DEG = (0.5, 65.0)       # grazing angle [deg]
+
+# Photon energy E [eV] times wavelength [Å] is a constant: E * lambda = h * c.
+HC_EV_ANGSTROM = 12398.41984
 
 # --- Film parameter ranges (every value is drawn uniformly inside its range) ---
 FILM_THICKNESS_RANGE = (20.0, 800.0)    # [Å]
@@ -115,11 +130,13 @@ DRY_RUN_SAMPLES = 1_000_000     # samples streamed by --dry-run when -n is not g
 CHUNK_SIZE = 25_000             # samples simulated at once (bigger = faster, more memory)
 
 # --- Output ---
-# Each dataset variant has a name: "fixed-q" (uniaxial film) or "fixed-q-isotropic".
-# Unless given on the command line, the outputs are named after it (see ``main``):
+# Each dataset variant has a name: "fixed-q", "fixed-q-isotropic", "variable-q-isotropic",
+# or "main" (variable-q, uniaxial: the original dataset). Unless given on the command
+# line, the outputs are named after it (see ``main``):
 #     plots/<variant>/                  preview and dry-run plots
 #     data/reflectivity-1m-<variant>/   Parquet files and dataset card
 #     branch <variant> of HF_REPO_ID    where the dataset is uploaded
+# The original dataset keeps its first locations: plots/, data/reflectivity-1m/, branch main.
 SHARD_SIZE = 100_000            # rows per Parquet file
 HF_REPO_ID = "carbon-lab/reflectivity-1m"
 UPLOAD = True                   # upload to Hugging Face after writing the dataset
@@ -130,33 +147,50 @@ def main() -> int:
     rng = np.random.default_rng(args.seed)
 
     # Name the outputs after the dataset variant unless they were given explicitly.
-    variant = "fixed-q-isotropic" if args.isotropic else "fixed-q"
+    if args.fixed_q:
+        variant = "fixed-q"
+    else:
+        variant = "variable-q"
+    if args.isotropic:
+        variant = variant + "-isotropic"
+    if variant == "variable-q":  # the original dataset keeps its original locations
+        default_plot_dir = Path("plots")
+        default_dataset_dir = Path("data") / "reflectivity-1m"
+        default_revision = "main"
+    else:
+        default_plot_dir = Path("plots") / variant
+        default_dataset_dir = Path("data") / f"reflectivity-1m-{variant}"
+        default_revision = variant
     if args.plot_dir is None:
-        args.plot_dir = Path("plots") / variant
+        args.plot_dir = default_plot_dir
     if args.output is None:
         args.output = args.plot_dir / "single_sample.png"
     if args.dataset_dir is None:
-        args.dataset_dir = Path("data") / f"reflectivity-1m-{variant}"
+        args.dataset_dir = default_dataset_dir
     if args.revision is None:
-        args.revision = variant
+        args.revision = default_revision
 
     if args.upload_only:
         return upload(args)
     if args.dry_run:
-        n_samples = DRY_RUN_SAMPLES if args.num_samples is None else args.num_samples
+        if args.num_samples is None:
+            n_samples = DRY_RUN_SAMPLES
+        else:
+            n_samples = args.num_samples
         run_dry_run(
-            n_samples, rng, args.isotropic, resolve_device(args.device), args.chunk_size, args.plot_dir
+            n_samples, rng, args.fixed_q, args.isotropic,
+            resolve_device(args.device), args.chunk_size, args.plot_dir,
         )
         return 0
     if args.num_samples is not None:
         write_dataset(
-            args.num_samples, rng, args.isotropic, resolve_device(args.device),
+            args.num_samples, rng, args.fixed_q, args.isotropic, resolve_device(args.device),
             args.chunk_size, args.shard_size, args.dataset_dir, args.plot_dir, args.revision,
         )
         if not args.upload:
             return 0
         return upload(args)
-    run_preview(rng, args.isotropic, args.output)
+    run_preview(rng, args.fixed_q, args.isotropic, args.output)
     return 0
 
 
@@ -165,12 +199,12 @@ def main() -> int:
 # =====================================================================================
 
 
-def run_preview(rng: np.random.Generator, isotropic: bool, output: Path) -> None:
+def run_preview(rng: np.random.Generator, fixed_q: bool, isotropic: bool, output: Path) -> None:
     """Simulate one random sample, print its parameters and plot it."""
     oxide = MaterialSLD(OXIDE_FORMULA, OXIDE_DENSITY, name="oxide")
     silicon = MaterialSLD(SILICON_FORMULA, SILICON_DENSITY, name="silicon")
 
-    energy_ev, q = sample_measurement(1, rng)
+    energy_ev, q = sample_measurement(1, rng, fixed_q)
     params = sample_parameters(1, rng, isotropic)
     layers, tensors = build_stack(energy_ev, params, oxide, silicon)
     r_s, r_p = simulate_reflectivity(q, energy_ev, layers, tensors, device="cpu")
@@ -195,6 +229,7 @@ def run_preview(rng: np.random.Generator, isotropic: bool, output: Path) -> None
 def run_dry_run(
     n_samples: int,
     rng: np.random.Generator,
+    fixed_q: bool,
     isotropic: bool,
     device: str,
     chunk_size: int,
@@ -208,13 +243,17 @@ def run_dry_run(
     # The curves are too big to keep, so we only add them to running histograms.
     all_params: dict[str, list[FloatArray]] = {}
     all_energies: list[FloatArray] = []
-    histogram_s = plot_reflectivity.RQ4Histogram(q_max=Q_RANGE[1])
-    histogram_p = plot_reflectivity.RQ4Histogram(q_max=Q_RANGE[1])
+    if fixed_q:
+        q_max = Q_RANGE[1]
+    else:
+        q_max = float(theta_to_q(np.array(THETA_RANGE_DEG[1]), ENERGY_RANGE_EV[1]))
+    histogram_s = plot_reflectivity.RQ4Histogram(q_max=q_max)
+    histogram_p = plot_reflectivity.RQ4Histogram(q_max=q_max)
 
     start_time = time.perf_counter()
     for start in range(0, n_samples, chunk_size):
         n_chunk = min(chunk_size, n_samples - start)
-        energy_ev, q = sample_measurement(n_chunk, rng)
+        energy_ev, q = sample_measurement(n_chunk, rng, fixed_q)
         params = sample_parameters(n_chunk, rng, isotropic)
         layers, tensors = build_stack(energy_ev, params, oxide, silicon)
         r_s, r_p = simulate_reflectivity(q, energy_ev, layers, tensors, device)
@@ -250,6 +289,7 @@ def run_dry_run(
 def write_dataset(
     n_samples: int,
     rng: np.random.Generator,
+    fixed_q: bool,
     isotropic: bool,
     device: str,
     chunk_size: int,
@@ -305,7 +345,7 @@ def write_dataset(
         )
         for start in range(shard_start, shard_end, chunk_size):
             n_chunk = min(chunk_size, shard_end - start)
-            energy_ev, q = sample_measurement(n_chunk, rng)
+            energy_ev, q = sample_measurement(n_chunk, rng, fixed_q)
             params = sample_parameters(n_chunk, rng, isotropic)
             layers, tensors = build_stack(energy_ev, params, oxide, silicon)
             r_s, r_p = simulate_reflectivity(q, energy_ev, layers, tensors, device)
@@ -331,8 +371,9 @@ def write_dataset(
     hf_dataset.write_dataset_card(
         dataset_dir, plot_dir,
         n_samples=n_samples, n_shards=n_shards, n_q=N_Q,
-        repo_id=HF_REPO_ID, revision=revision, isotropic=isotropic,
+        repo_id=HF_REPO_ID, revision=revision, isotropic=isotropic, fixed_q=fixed_q,
         q_range=Q_RANGE, energy_ev=ENERGY_EV,
+        theta_range_deg=THETA_RANGE_DEG, energy_range_ev=ENERGY_RANGE_EV,
         film_thickness_range=FILM_THICKNESS_RANGE, film_roughness_max=FILM_ROUGHNESS_RANGE[1],
         oxide_thickness_range=OXIDE_THICKNESS_RANGE,
         delta_range=DELTA_MAGNITUDE_RANGE, beta_max=BETA_MAGNITUDE_RANGE[1],
@@ -354,7 +395,7 @@ def upload(args: argparse.Namespace) -> int:
             f"Hugging Face upload failed ({error}).\n"
             f"The local Parquet files are kept in '{args.dataset_dir}'.\n"
             f"Log in with `uv run hf auth login` (or set HF_TOKEN), then retry with:\n"
-            f"  uv run python scripts/generate_reflectivity.py --upload-only "
+            f"  uv run python -m refltron.dataset.generate_reflectivity --upload-only "
             f"--dataset-dir {args.dataset_dir} --repo-id {args.repo_id} --revision {args.revision}"
         )
         return 1
@@ -367,16 +408,33 @@ def upload(args: argparse.Namespace) -> int:
 # =====================================================================================
 
 
-def sample_measurement(n: int, rng: np.random.Generator) -> tuple[FloatArray, FloatArray]:
+def sample_measurement(
+    n: int, rng: np.random.Generator, fixed_q: bool
+) -> tuple[FloatArray, FloatArray]:
     """Return where each curve is measured: one photon energy and N_Q q values per sample.
 
-    Returns ``(energy_ev, q)`` with shapes (n,) and (n, N_Q). Every sample shares the
-    fixed ENERGY_EV and Q_GRID, so nothing random is drawn here (``rng`` is kept so the
-    function can go back to random measurements without changing its callers).
+    Returns ``(energy_ev, q)`` with shapes (n,) and (n, N_Q); q is in 1/Å, small to large.
+      - fixed_q:     every sample shares ENERGY_EV and Q_GRID (nothing random is drawn).
+      - not fixed_q: each sample gets a random energy in ENERGY_RANGE_EV and N_Q random
+                     angles in THETA_RANGE_DEG, sorted and converted to q.
     """
-    energy_ev = np.full(n, ENERGY_EV)
-    q = np.tile(Q_GRID, (n, 1))  # the same row of q values, repeated n times
+    if fixed_q:
+        energy_ev = np.full(n, ENERGY_EV)
+        q = np.tile(Q_GRID, (n, 1))  # the same row of q values, repeated n times
+        return energy_ev, q
+
+    energy_ev = rng.uniform(ENERGY_RANGE_EV[0], ENERGY_RANGE_EV[1], size=n)
+    theta_deg = rng.uniform(THETA_RANGE_DEG[0], THETA_RANGE_DEG[1], size=(n, N_Q))
+    theta_deg.sort(axis=1)
+    # energy_ev has shape (n,); reshape to (n, 1) so each row of angles uses its own energy.
+    q = theta_to_q(theta_deg, energy_ev.reshape(n, 1))
     return energy_ev, q
+
+
+def theta_to_q(theta_deg: FloatArray, energy_ev: float | FloatArray) -> FloatArray:
+    """Convert grazing angle [deg] at a photon energy [eV] to q = (4 pi / lambda) sin(theta) [1/Å]."""
+    wavelength = HC_EV_ANGSTROM / np.asarray(energy_ev, dtype=np.float64)
+    return (4.0 * math.pi / wavelength) * np.sin(np.deg2rad(theta_deg))
 
 
 def sample_parameters(n: int, rng: np.random.Generator, isotropic: bool) -> Parameters:
@@ -545,6 +603,7 @@ def parse_args() -> argparse.Namespace:
     mode.add_argument("--upload-only", action="store_true", help="upload an existing --dataset-dir without generating")
 
     run = parser.add_argument_group("run")
+    run.add_argument("--fixed-q", action=on_off, default=FIXED_Q, help="one energy and q grid for all samples (--no-fixed-q: random per sample)")
     run.add_argument("--isotropic", action=on_off, default=ISOTROPIC, help="isotropic film (delta_xx = delta_zz, beta_xx = beta_zz)")
     run.add_argument("--seed", type=int, default=SEED, help="random seed")
     run.add_argument("--device", choices=("auto", "cpu", "gpu"), default=DEVICE, help="where to run the simulation")

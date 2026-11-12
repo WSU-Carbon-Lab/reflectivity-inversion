@@ -19,7 +19,7 @@ import numpy as np
 import torch
 from torch import Tensor, nn
 
-import physics
+from refltron.common import physics
 
 # The 7 film parameters, in the same order as the dataset columns and the network outputs.
 LABEL_NAMES: tuple[str, ...] = (
@@ -39,6 +39,36 @@ LABEL_MIN = (20.0, 0.0, 0.0, -5.0e-3, -5.0e-3, 0.0, 0.0)
 LABEL_MAX = (800.0, 40.0, 15.0, 5.0e-3, 5.0e-3, 5.0e-3, 5.0e-3)
 
 LOSS_CHOICES = ("profile", "mse", "hybrid")
+
+# An isotropic film has delta_zz = delta_xx and beta_zz = beta_xx, so a model for
+# isotropic films predicts only the xx one; this says where each zz value comes from.
+ISOTROPIC_PARTNER = {"delta_zz": "delta_xx", "beta_zz": "beta_xx"}
+
+
+def label_range(label_names):
+    """(minimum, maximum) training range of the given labels, as two float32 arrays."""
+    minimum = np.zeros(len(label_names), dtype=np.float32)
+    maximum = np.zeros(len(label_names), dtype=np.float32)
+    for i in range(len(label_names)):
+        position = LABEL_NAMES.index(label_names[i])  # where this label sits in LABEL_NAMES
+        minimum[i] = LABEL_MIN[position]
+        maximum[i] = LABEL_MAX[position]
+    return minimum, maximum
+
+
+def expand_to_all_labels(values: Tensor, label_names) -> Tensor:
+    """Turn (batch, len(label_names)) values into all 7 labels in LABEL_NAMES order.
+
+    A missing zz label is filled with its xx partner (isotropic film). With all 7
+    labels given, the values come back unchanged.
+    """
+    columns = []
+    for name in LABEL_NAMES:
+        if name in label_names:
+            columns.append(values[:, label_names.index(name)])
+        else:
+            columns.append(values[:, label_names.index(ISOTROPIC_PARTNER[name])])
+    return torch.stack(columns, dim=1)
 
 
 class LabelMSELoss(nn.Module):
@@ -196,7 +226,8 @@ class DepthProfileLoss(LabelMSELoss):
         zero = torch.zeros_like(pred[:, 0])
 
         def interface_depths(labels):
-            film_t, oxide_t = labels[:, 0], labels[:, 2]
+            film_t = labels[:, 0]
+            oxide_t = labels[:, 2]
             return torch.stack((-(film_t + oxide_t), -oxide_t, zero), dim=-1)
 
         positions = torch.cat((interface_depths(pred), interface_depths(true)), dim=-1)  # (batch, 6)

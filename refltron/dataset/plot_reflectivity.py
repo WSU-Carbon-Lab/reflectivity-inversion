@@ -91,9 +91,10 @@ def plot_sample(
     figure, (ax_curve, ax_depth) = plt.subplots(2, 1, figsize=(9.0, 9.0), layout="constrained")
 
     # --- Reflectivity ---
-    marker_style = {"linestyle": "", "marker": "o", "markersize": 4, "markerfacecolor": "none"}
-    ax_curve.plot(q, r_s, color="tab:blue", label="s polarization", **marker_style)
-    ax_curve.plot(q, r_p, color="tab:red", label="p polarization", **marker_style)
+    ax_curve.plot(q, r_s, color="tab:blue", label="s polarization",
+                  linestyle="", marker="o", markersize=4, markerfacecolor="none")
+    ax_curve.plot(q, r_p, color="tab:red", label="p polarization",
+                  linestyle="", marker="o", markersize=4, markerfacecolor="none")
     ax_curve.set_xlabel(r"$q$ [$\mathrm{\AA}^{-1}$]")
     ax_curve.set_ylabel("reflectivity")
     ax_curve.set_yscale("log")
@@ -116,19 +117,28 @@ def plot_sample(
     x_in_data_y_in_axes = ax_depth.get_xaxis_transform()
     for i in range(len(LAYER_NAMES)):
         ax_depth.axvspan(edges[i], edges[i + 1], color=shades[i], zorder=0)
-        label_height = 0.90 if LAYER_NAMES[i] == "oxide" else 0.96  # oxide is thin; avoid overlap
+        if LAYER_NAMES[i] == "oxide":
+            label_height = 0.90  # the oxide is thin: put its label lower so it doesn't overlap
+        else:
+            label_height = 0.96
         ax_depth.text(
             0.5 * (edges[i] + edges[i + 1]), label_height, LAYER_NAMES[i],
             ha="center", va="top", transform=x_in_data_y_in_axes,
         )
     for i in range(len(boundaries)):
         ax_depth.axvline(boundaries[i], color="0.5", linewidth=0.8)
-        on_left = i == 1  # put the film | oxide label left of its line so it doesn't collide
+        # Put the film | oxide label (i = 1) left of its line so it doesn't collide.
+        if i == 1:
+            offset = (-3, 2)
+            alignment = "right"
+        else:
+            offset = (3, 2)
+            alignment = "left"
         ax_depth.annotate(
             f"σ {roughnesses[i]:.1f} Å", (boundaries[i], 0.02),
             xycoords=x_in_data_y_in_axes,
-            xytext=(-3 if on_left else 3, 2), textcoords="offset points",
-            ha="right" if on_left else "left", fontsize=8, color="0.35",
+            xytext=offset, textcoords="offset points",
+            ha=alignment, fontsize=8, color="0.35",
         )
     ax_depth.set_xlabel(r"depth [$\mathrm{\AA}$]")
     ax_depth.set_ylabel(r"$\delta$, $\beta$")
@@ -261,11 +271,14 @@ def plot_parameter_distributions(
     ax.legend(loc="lower right", fontsize=8)
 
     ax = axes[2, 1]
-    step_style = {"bins": bins, "density": True, "histtype": "step", "linewidth": 1.5}
-    ax.hist(params["delta_xx"] * 1e3, color="tab:blue", label=r"$\delta_{xx}$", **step_style)
-    ax.hist(params["delta_zz"] * 1e3, color="tab:red", label=r"$\delta_{zz}$", **step_style)
-    ax.hist(params["beta_xx"] * 1e3, color="tab:blue", linestyle="--", label=r"$\beta_{xx}$", **step_style)
-    ax.hist(params["beta_zz"] * 1e3, color="tab:red", linestyle="--", label=r"$\beta_{zz}$", **step_style)
+    ax.hist(params["delta_xx"] * 1e3, bins=bins, density=True, histtype="step", linewidth=1.5,
+            color="tab:blue", label=r"$\delta_{xx}$")
+    ax.hist(params["delta_zz"] * 1e3, bins=bins, density=True, histtype="step", linewidth=1.5,
+            color="tab:red", label=r"$\delta_{zz}$")
+    ax.hist(params["beta_xx"] * 1e3, bins=bins, density=True, histtype="step", linewidth=1.5,
+            color="tab:blue", linestyle="--", label=r"$\beta_{xx}$")
+    ax.hist(params["beta_zz"] * 1e3, bins=bins, density=True, histtype="step", linewidth=1.5,
+            color="tab:red", linestyle="--", label=r"$\beta_{zz}$")
     ax.set_xlabel(r"tensor component [$\times 10^{-3}$]")
     ax.set_title("stored uniaxial tensor components")
     ax.legend(loc="upper left", fontsize=8, ncol=2)

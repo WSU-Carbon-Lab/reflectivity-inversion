@@ -1,9 +1,9 @@
 """Train the network to predict thin-film parameters from reflectivity curves.
 
-    uv run python scripts/train.py                   # use the defaults below
-    uv run python scripts/train.py --epochs 20 --max-samples 50000 --local   # quick test
-    uv run python scripts/train.py --help            # list every option
-    uv run python scripts/train.py --resume checkpoints/<run>/best.pt   # continue a stopped run
+    uv run python -m refltron.multi_channel_mlp.train                   # use the defaults below
+    uv run python -m refltron.multi_channel_mlp.train --epochs 20 --max-samples 50000 --local   # quick test
+    uv run python -m refltron.multi_channel_mlp.train --help            # list every option
+    uv run python -m refltron.multi_channel_mlp.train --resume checkpoints/<run>/best.pt   # continue a stopped run
 
 Every option has a default in the DEFAULT SETTINGS block. Edit a value there to change
 it permanently, or pass the matching command-line flag to change it for one run.
@@ -25,9 +25,9 @@ import polars as pl
 import torch
 from torch.utils.data import DataLoader, Subset, TensorDataset
 
-from loss import LABEL_NAMES, LOSS_CHOICES, DepthProfileLoss, LabelMSELoss, build_loss
-from metrics import MetricStore
-from network import ACTIVATION_CHOICES, REGULARIZER_CHOICES, ReflectivityNet
+from refltron.common.loss import LABEL_NAMES, LOSS_CHOICES, DepthProfileLoss, LabelMSELoss, build_loss
+from refltron.multi_channel_mlp.metrics import MetricStore
+from refltron.multi_channel_mlp.network import ACTIVATION_CHOICES, REGULARIZER_CHOICES, ReflectivityNet
 
 # =====================================================================================
 # DEFAULT SETTINGS: edit these, or override any of them from the command line.
@@ -69,7 +69,9 @@ RESUME = None               # path to a .pt checkpoint to continue training from
 
 def main():
     args = parse_args()
-    resume = load_resume_checkpoint(args) if args.resume else None
+    resume = None
+    if args.resume is not None:
+        resume = load_resume_checkpoint(args)
     torch.manual_seed(args.seed)
     device = select_device(args.device)
     print(f"Device: {device} | regularizer={args.regularizer} | activation={args.activation} | loss={args.loss}")
@@ -129,10 +131,14 @@ def main():
 def train_one_epoch(model, loader, criterion, optimizer, device):
     """One pass over the training rows. Returns the average training loss."""
     model.train()  # training mode (matters for layers like dropout; harmless here)
-    total_loss, total_rows = 0.0, 0
+    total_loss = 0.0
+    total_rows = 0
 
     for s, p, q, targets in loader:
-        s, p, q, targets = s.to(device), p.to(device), q.to(device), targets.to(device)
+        s = s.to(device)
+        p = p.to(device)
+        q = q.to(device)
+        targets = targets.to(device)
 
         # Forward pass: predict the normalized labels and measure how wrong they are.
         predictions = model(s, p, q)
@@ -159,23 +165,31 @@ def evaluate(model, loader, criterion, profile_metric, mse_metric, device):
     units ("mae", shape (7,)).
     """
     model.eval()
-    sums = {"loss": 0.0, "profile_l2": 0.0, "mse": 0.0}
+    loss_sum = 0.0
+    profile_sum = 0.0
+    mse_sum = 0.0
     mae_sum = torch.zeros(len(LABEL_NAMES), device=device)
     total_rows = 0
 
     for s, p, q, targets in loader:
-        s, p, q, targets = s.to(device), p.to(device), q.to(device), targets.to(device)
+        s = s.to(device)
+        p = p.to(device)
+        q = q.to(device)
+        targets = targets.to(device)
         predictions = model(s, p, q)
         n = len(s)
-        sums["loss"] += criterion(predictions, targets, q).item() * n
-        sums["profile_l2"] += profile_metric(predictions, targets, q).item() * n
-        sums["mse"] += mse_metric(predictions, targets, q).item() * n
+        loss_sum += criterion(predictions, targets, q).item() * n
+        profile_sum += profile_metric(predictions, targets, q).item() * n
+        mse_sum += mse_metric(predictions, targets, q).item() * n
         mae_sum += criterion.physical_mae(predictions, targets) * n
         total_rows += n
 
-    results = {name: value / total_rows for name, value in sums.items()}
-    results["mae"] = (mae_sum / total_rows).cpu()
-    return results
+    return {
+        "loss": loss_sum / total_rows,
+        "profile_l2": profile_sum / total_rows,
+        "mse": mse_sum / total_rows,
+        "mae": (mae_sum / total_rows).cpu(),
+    }
 
 
 def load_dataset(data_path=None, max_samples=None):
@@ -226,7 +240,9 @@ def build_model(args, dataset, train_set):
     )
     if args.normalize_inputs:
         rows = torch.tensor(train_set.indices[:NORMALIZATION_ROWS])  # training rows only
-        s, p, q, _ = dataset.tensors
+        s = dataset.tensors[0]
+        p = dataset.tensors[1]
+        q = dataset.tensors[2]
         model.fit_input_normalization(s[rows], p[rows], q[rows])
         print(f"Input mean (S, P, q): {model.input_mean.squeeze().tolist()}")
         print(f"Input std  (S, P, q): {model.input_std.squeeze().tolist()}")
@@ -246,10 +262,13 @@ def load_resume_checkpoint(args):
     """Load a checkpoint and copy its run settings onto ``args`` (--epochs may extend the run)."""
     checkpoint = torch.load(args.resume, map_location="cpu", weights_only=False)
     config = checkpoint["config"]
-    epochs_from_cli = args.epochs if args.epochs != EPOCHS else None
+    # A different --epochs on the command line means "extend the run to this many epochs".
+    epochs_from_cli = None
+    if args.epochs != EPOCHS:
+        epochs_from_cli = args.epochs
     for name in RESUMED_SETTINGS:
         if name in config:
-            setattr(args, name, config[name])
+            setattr(args, name, config[name])  # same as args.<name> = config[name]
     if epochs_from_cli is not None:
         args.epochs = epochs_from_cli
     return checkpoint

@@ -16,34 +16,31 @@ import matplotlib
 
 # Save figures directly to PNG files without opening an interactive window.
 matplotlib.use("Agg")
-from matplotlib.lines import Line2D
 import matplotlib.pyplot as plt
 import numpy as np
 from refloxide.model import FreeUniTensor, MaterialSLD, ReflectModel
 import torch
 import wandb
 
-import physics
-from loss import LABEL_NAMES, DepthProfileLoss
+from refltron.common import physics
+from refltron.common import plot_style as ps
+from refltron.common.depth_profile import estimate_substrate_sld
+from refltron.common.loss import LABEL_NAMES, DepthProfileLoss
+from refltron.common.snapshot_plots import plot_depth_profile_panel, plot_label_bars
+from refltron.common.tracking import WANDB_BASE_URL, WANDB_ENTITY, WANDB_PROJECT
 
-# Readable tick and label sizes for the large snapshot figures.
-plt.rcParams.update({"xtick.labelsize": 10.5, "ytick.labelsize": 10.5, "axes.labelsize": 12, "axes.titlesize": 12.5})
+ps.apply()  # shared figure style (colours, fonts, hairline grid)
 
 # W&B project: https://forge.coreweave.com/wandb/als-rixs/reflectivity-inversion
 # (Training runs 100% on local hardware; W&B is only used to log metrics & checkpoints.)
-WANDB_BASE_URL = "https://api.forge.coreweave.com"
-WANDB_ENTITY = "als-rixs"
-WANDB_PROJECT = "reflectivity-inversion"
+# The W&B settings themselves live in refltron/common/tracking.py.
 
 # Snapshot rows are picked with a film thickness close to this [Å].
 SNAPSHOT_THICKNESS = 200.0
 
-COMPONENT_COLORS = {
-    "delta_xx": ("tab:blue", r"$\delta_{xx}$"),
-    "delta_zz": ("tab:red", r"$\delta_{zz}$"),
-    "beta_xx": ("tab:green", r"$\beta_{xx}$"),
-    "beta_zz": ("tab:orange", r"$\beta_{zz}$"),
-}
+# Short tick labels for the label bar chart, in LABEL_NAMES order.
+LABEL_TICKS = ("film\nthickness", "film\nroughness", "oxide\nthickness",
+               r"$\delta_{xx}$", r"$\delta_{zz}$", r"$\beta_{xx}$", r"$\beta_{zz}$")
 
 
 def pick_sample_near_thickness(
@@ -66,10 +63,6 @@ def pick_sample_near_thickness(
     return best_idx
 
 
-def estimate_substrate_sld(q):
-    """Substrate optical constants (oxide_delta, oxide_beta, si_delta, si_beta) for one curve's q grid."""
-    energy_ev = physics.estimate_energy(float(q[0]), float(q[-1]))
-    return physics.substrate_optical_constants(energy_ev)
 
 
 def _oxide_and_silicon(oxide_t):
@@ -112,8 +105,13 @@ def build_ood_test_cases(n_q=256, seed=2026):
     e_thick = 250.0
     theta_thick = np.sort(rng.uniform(0.5, 65.0, size=n_q))
     q_thick = (4.0 * math.pi * e_thick / physics.HC_EV_ANGSTROM) * np.sin(np.deg2rad(theta_thick))
-    film_t, film_sigma, ox_t_thick = 2000.0, 12.0, 8.0
-    d_xx, d_zz, b_xx, b_zz = 2.2e-3, 1.1e-3, 0.8e-3, 0.3e-3
+    film_t = 2000.0
+    film_sigma = 12.0
+    ox_t_thick = 8.0
+    d_xx = 2.2e-3
+    d_zz = 1.1e-3
+    b_xx = 0.8e-3
+    b_zz = 0.3e-3
 
     vac_2 = MaterialSLD("", 0.0, name="vacuum")(0.0, 0.0)
     film_2 = FreeUniTensor(energies=[e_thick], name="film")
@@ -150,50 +148,6 @@ def build_ood_test_cases(n_q=256, seed=2026):
     ]
 
 
-def compute_depth_profile(labels, h, substrate_sld):
-    """Erf-smoothed (delta_xx, delta_zz, beta_xx, beta_zz) vs height h [Å] above silicon.
-
-    The oxide|Si interface is pinned at ``h = 0`` (matching ``DepthProfileLoss``), the
-    film|oxide interface at ``h = oxide_t`` and the vacuum|film surface at
-    ``h = film_t + oxide_t``. Returns interface heights ordered vacuum -> Si.
-    """
-    ox_delta, ox_beta, si_delta, si_beta = substrate_sld
-
-    film_t = max(float(labels[0]), 0.0)
-    film_sigma = max(float(labels[1]), 0.0)
-    oxide_t = max(float(labels[2]), 0.0)
-    delta_xx = float(labels[3])
-    delta_zz = float(labels[4])
-    beta_xx = float(labels[5])
-    beta_zz = float(labels[6])
-
-    heights = [film_t + oxide_t, oxide_t, 0.0]
-    roughnesses = [film_sigma, physics.oxide_roughness(oxide_t), physics.SILICON_ROUGHNESS]
-
-    # Optical constants in each slab: [vacuum, film, oxide, silicon].
-    slab_values = {
-        "delta_xx": [0.0, delta_xx, ox_delta, si_delta],
-        "delta_zz": [0.0, delta_zz, ox_delta, si_delta],
-        "beta_xx": [0.0, beta_xx, ox_beta, si_beta],
-        "beta_zz": [0.0, beta_zz, ox_beta, si_beta],
-    }
-
-    h_tensor = torch.from_numpy(np.asarray(h, dtype=np.float64))
-    curves = {}
-    for name, values in slab_values.items():
-        profile = torch.full_like(h_tensor, values[0])
-        for i in range(3):
-            b = heights[i]
-            sigma = roughnesses[i]
-            # Stepping *down* in height crosses from slab i into slab i+1.
-            if sigma > 0.0:
-                step = 0.5 * (1.0 + torch.erf((b - h_tensor) / (math.sqrt(2.0) * sigma)))
-            else:
-                step = (h_tensor <= b).to(h_tensor.dtype)
-            profile = profile + (values[i + 1] - values[i]) * step
-        curves[name] = profile.numpy()
-
-    return heights, roughnesses, curves
 
 
 def plot_sample_column(
@@ -210,120 +164,76 @@ def plot_sample_column(
     substrate_sld,
     bare_oxide=False,
 ):
-    """Fill one column (Reflectivity, Depth Profile, Label Bars) like single_sample.png."""
-    ax_refl, ax_depth, ax_bar = axes_col
+    """Fill one column: reflectivity (top), depth profile (middle), labels (bottom)."""
+    ax_refl = axes_col[0]
+    ax_depth = axes_col[1]
+    ax_bar = axes_col[2]
 
-    # 1. Top axis: s and p polarized reflectivity vs q.
-    ms = 2.6 if bare_oxide is False and true_phys[0] > 1000.0 else 3.6
-    ax_refl.plot(
-        q, r_s, label="s polarization", color="tab:blue",
-        linestyle="-" if ms < 3.0 else "", linewidth=0.8,
-        marker="o", markersize=ms, markerfacecolor="none",
-    )
-    ax_refl.plot(
-        q, r_p, label="p polarization", color="tab:red",
-        linestyle="-" if ms < 3.0 else "", linewidth=0.8,
-        marker="o", markersize=ms, markerfacecolor="none",
-    )
+    # 1. Top: s and p polarized reflectivity vs q, labelled at the curve ends.
+    s_color = ps.POLARIZATION_COLORS["s"]
+    ax_refl.plot(q, r_s, color=s_color, lw=1.3)
+    ax_refl.text(q[-1], r_s[-1], "  s", color=s_color, fontsize=11.5, va="center", weight="medium")
+    p_color = ps.POLARIZATION_COLORS["p"]
+    ax_refl.plot(q, r_p, color=p_color, lw=1.3)
+    ax_refl.text(q[-1], r_p[-1], "  p", color=p_color, fontsize=11.5, va="center", weight="medium")
     ax_refl.set_yscale("log")
-    ax_refl.set_xlabel(r"$q$ [$\mathrm{\AA}^{-1}$]")
+    ps.no_minor_grid(ax_refl)
+    ax_refl.set_xlim(0, q[-1] * 1.08)
+    ax_refl.set_xlabel(r"$q$  [$\mathrm{\AA}^{-1}$]")
     ax_refl.set_ylabel("reflectivity")
-    ax_refl.set_title(f"{title_prefix} — s & p reflectivity")
-    ax_refl.grid(True, which="both", alpha=0.3)
-    ax_refl.legend(loc="upper right", fontsize=10.5)
+    ax_refl.set_title(title_prefix)
 
-    # 2. Middle axis: optical-constant height map (Truth vs Network), both pinned at
-    #    the silicon interface (h = 0, right edge) so film surfaces can be compared.
-    true_top = max(float(true_phys[0]) + float(true_phys[2]), 15.0)
-    pred_cap = max(2500.0, true_top * 1.35)
-    pred_top = min(max(float(pred_phys[0]) + max(float(pred_phys[2]), 0.0), 0.0), pred_cap)
-    max_h = max(true_top, pred_top)
-    pad = max(15.0, 0.06 * max_h)
-    si_pad = max(10.0, 0.04 * max_h)
-    h = np.linspace(-si_pad, max_h + pad, 2000)
+    # 2. Middle: optical constants vs height (truth vs network).
+    plot_depth_profile_panel(ax_depth, true_phys, pred_phys, substrate_sld, profile_l2)
 
-    true_heights, _, true_curves = compute_depth_profile(true_phys, h, substrate_sld)
-    pred_heights, _, pred_curves = compute_depth_profile(pred_phys, h, substrate_sld)
+    # 3. Bottom: the 7 labels, normalized so 0 and 1 are the edges of the training range.
+    plot_label_bars(ax_bar, true_norm, pred_norm, LABEL_TICKS, true_phys, pred_phys, bare_oxide=bare_oxide)
 
-    # Shade vacuum | film | oxide | silicon using the true interface heights.
-    edges = [h[-1], true_heights[0], true_heights[1], true_heights[2], h[0]]
-    regions = ("vacuum", "film", "oxide", "Si")
-    shades = ("0.97", "0.92", "0.84", "0.76")
-    xaxis_transform = ax_depth.get_xaxis_transform()
-    h_span = h[-1] - h[0]
 
-    for i, (region, shade) in enumerate(zip(regions, shades)):
-        ax_depth.axvspan(edges[i + 1], edges[i], color=shade, zorder=0)
-        slab_width = edges[i] - edges[i + 1]
-        if slab_width < 0.03 * h_span:
-            continue
-        rotate = 90 if slab_width < 0.075 * h_span else 0
-        ax_depth.text(
-            0.5 * (edges[i] + edges[i + 1]), 0.96, region,
-            ha="center", va="top", rotation=rotate,
-            fontsize=10.5, color="0.25", transform=xaxis_transform,
+def save_snapshot_figure(
+    path, epoch, loss_name, train_loss, val_loss,
+    column_titles, column_bare_flags, column_slds,
+    sample_s, sample_p, sample_q, sample_targets,
+    target_norm, pred_norm, pred_phys, profile_losses,
+):
+    """Save the snapshot figure: 4 columns (Training, Validation, OOD Bare Oxide, OOD 2000 Å).
+
+    Every ``column_*`` list and every ``sample_*`` / ``*_norm`` / ``pred_phys`` tensor has
+    one entry per column. Used by MetricStore during training and by render_snapshot.py.
+    """
+    fig, axes = plt.subplots(
+        3, 4,
+        figsize=(26.0, 11.5),
+        gridspec_kw={"height_ratios": [1.0, 1.15, 0.78]},
+        layout="constrained",
+    )
+
+    s_np = sample_s.cpu().numpy()
+    p_np = sample_p.cpu().numpy()
+    q_np = sample_q.cpu().numpy()
+    t_phys = sample_targets.cpu().tolist()
+    p_phys = pred_phys.cpu().tolist()
+    t_norm = target_norm.cpu().tolist()
+    p_norm = pred_norm.cpu().tolist()
+
+    for col in range(4):
+        plot_sample_column(
+            axes[:, col],
+            column_titles[col],
+            q_np[col], s_np[col], p_np[col],
+            t_phys[col], p_phys[col], t_norm[col], p_norm[col],
+            profile_losses[col],
+            column_slds[col],
+            bare_oxide=column_bare_flags[col],
         )
 
-    for b in true_heights:
-        ax_depth.axvline(b, color="0.55", linewidth=0.8)
-    # Predicted film surface and film|oxide interface (dashed) vs the shared Si reference.
-    ax_depth.axvline(pred_heights[0], color="0.15", linestyle="--", linewidth=1.0)
-    ax_depth.axvline(pred_heights[1], color="0.15", linestyle=":", linewidth=0.9)
-    ax_depth.axhline(0.0, color="0.6", linewidth=0.6, linestyle=":")
-
-    # Plot Truth as thick translucent ribbons and Network as crisp dashed curves.
-    for key, (color, _) in COMPONENT_COLORS.items():
-        ax_depth.plot(h, true_curves[key], color=color, linestyle="-", linewidth=3.2, alpha=0.40)
-        ax_depth.plot(h, pred_curves[key], color=color, linestyle="--", linewidth=1.6, alpha=1.0)
-
-    legend_handles = [
-        Line2D([0], [0], color=color, lw=2.0, label=tex)
-        for color, tex in COMPONENT_COLORS.values()
-    ] + [
-        Line2D([0], [0], color="0.35", lw=3.2, alpha=0.45, linestyle="-", label="truth"),
-        Line2D([0], [0], color="0.20", lw=1.6, linestyle="--", label="network"),
-    ]
-    # Height decreases left -> right so the silicon substrate is always at the right edge.
-    ax_depth.set_xlim(h[-1], h[0])
-    ax_depth.set_xlabel(r"height above Si interface [$\mathrm{\AA}$]  (vacuum $\leftarrow$ $\rightarrow$ substrate)")
-    ax_depth.set_ylabel(r"$\delta$, $\beta$")
-    ax_depth.set_title(
-        f"film top above Si: truth {true_heights[0]:.0f} Å · net {pred_heights[0]:.0f} Å · L2 {profile_l2:.2e}",
-        fontsize=12.5,
+    fig.suptitle(
+        f"Epoch {epoch}   ·   {loss_name} loss: train {train_loss:.2e}, validation {val_loss:.2e}   ·   "
+        f"out-of-distribution profile L2: bare oxide {profile_losses[2]:.1e}, 2000 Å film {profile_losses[3]:.1e}",
+        fontsize=16, x=0.008, ha="left", color=ps.INK,
     )
-    ax_depth.margins(y=0.14)
-    ax_depth.grid(True, which="both", alpha=0.3)
-    ax_depth.legend(handles=legend_handles, loc="lower left", fontsize=10, ncol=3)
-
-    # 3. Bottom axis: side-by-side normalized [0, 1] label comparison bar chart.
-    # Dotted lines at 0.0 and 1.0 mark the training-set bounds; OOD bars cross outside!
-    x = np.arange(len(LABEL_NAMES))
-    width = 0.36
-    ax_bar.axhline(0.0, color="0.65", linewidth=0.7, linestyle=":")
-    ax_bar.axhline(1.0, color="0.65", linewidth=0.7, linestyle=":")
-
-    if bare_oxide:
-        # At 0 Å film thickness, only film_thickness (idx 0) and oxide_thickness (idx 2)
-        # are physically defined; fade the 5 unused film optical/roughness bars.
-        active = [0, 2]
-        unused = [1, 3, 4, 5, 6]
-        ax_bar.bar(x[active] - width / 2, np.array(true_norm)[active], width=width, color="0.55", label="truth")
-        ax_bar.bar(x[active] + width / 2, np.array(pred_norm)[active], width=width, color="tab:blue", label="network")
-        ax_bar.bar(x[unused] + width / 2, np.array(pred_norm)[unused], width=width, color="tab:blue", alpha=0.25, hatch="//")
-        bar_title = f"normalized labels (hatched = film n/a at 0 Å; ox truth {true_phys[2]:.1f} vs {pred_phys[2]:.1f} Å)"
-    else:
-        ax_bar.bar(x - width / 2, true_norm, width=width, color="0.55", label="truth")
-        ax_bar.bar(x + width / 2, pred_norm, width=width, color="tab:blue", label="network")
-        bar_title = "normalized [0, 1] labels (dotted [0, 1] = training range)"
-
-    ax_bar.set_xticks(x, LABEL_NAMES, rotation=22, ha="right")
-    ax_bar.set_ylabel("normalized [0, 1]")
-    ax_bar.set_title(bar_title)
-    y_lo = min(-0.12, float(min(min(true_norm), min(pred_norm))) - 0.08)
-    y_hi = max(1.15, float(max(max(true_norm), max(pred_norm))) + 0.12)
-    ax_bar.set_ylim(y_lo, y_hi)
-    ax_bar.grid(True, axis="y", alpha=0.3)
-    ax_bar.legend(loc="upper right", fontsize=10.5, ncol=2)
+    fig.savefig(path, dpi=200)
+    plt.close(fig)
 
 
 class MetricStore:
@@ -361,8 +271,17 @@ class MetricStore:
             dataset, val_set.indices, target_thickness=SNAPSHOT_THICKNESS, exclude_idx=self.train_sample_idx
         )
 
-        tr_s, tr_p, tr_q, tr_target = dataset[self.train_sample_idx]
-        val_s, val_p, val_q, val_target = dataset[self.val_sample_idx]
+        # Each dataset row is (s, p, q, labels).
+        train_row = dataset[self.train_sample_idx]
+        tr_s = train_row[0]
+        tr_p = train_row[1]
+        tr_q = train_row[2]
+        tr_target = train_row[3]
+        val_row = dataset[self.val_sample_idx]
+        val_s = val_row[0]
+        val_p = val_row[1]
+        val_q = val_row[2]
+        val_target = val_row[3]
         ood_cases = build_ood_test_cases()
 
         # Stack all 4 showcase columns: [Train, Val, OOD Bare Oxide, OOD Thick 2000 Å].
@@ -413,10 +332,14 @@ class MetricStore:
         if resume is not None:
             self.config["resumed_from"] = str(args.resume)
             self.config["resumed_at_epoch"] = resume["epoch"]
+        if args.local:
+            wandb_mode = "offline"
+        else:
+            wandb_mode = "online"
         self.run = wandb.init(
             entity=WANDB_ENTITY,
             project=WANDB_PROJECT,
-            mode="offline" if args.local else "online",
+            mode=wandb_mode,
             config=self.config,
             name=args.run_name,
             settings=wandb.Settings(base_url=WANDB_BASE_URL),
@@ -426,7 +349,9 @@ class MetricStore:
         if resume is not None:
             self.ckpt_dir = Path(args.resume).parent
         else:
-            run_id = self.run.id if self.run.id else "local-run"
+            run_id = self.run.id
+            if not run_id:
+                run_id = "local-run"
             self.ckpt_dir = Path(args.checkpoint_dir) / run_id
         self.ckpt_dir.mkdir(parents=True, exist_ok=True)
 
@@ -473,8 +398,9 @@ class MetricStore:
             metrics["val/profile_l2"] = val_profile_l2
         if val_mse is not None:
             metrics["val/label_mse"] = val_mse
-        for label_name, mae_value in zip(LABEL_NAMES, val_mae.tolist()):
-            metrics[f"val/mae_{label_name}"] = mae_value
+        mae_values = val_mae.tolist()
+        for i in range(len(LABEL_NAMES)):
+            metrics[f"val/mae_{LABEL_NAMES[i]}"] = mae_values[i]
         self.run.log(metrics, step=epoch)
 
         print(
@@ -504,9 +430,9 @@ class MetricStore:
             )
             self.saved_checkpoints.append(pair)
             while len(self.saved_checkpoints) > self.max_checkpoints:
-                old_ckpt, old_fig = self.saved_checkpoints.pop(0)
-                old_ckpt.unlink(missing_ok=True)
-                old_fig.unlink(missing_ok=True)
+                oldest = self.saved_checkpoints.pop(0)  # (checkpoint file, figure file)
+                oldest[0].unlink(missing_ok=True)
+                oldest[1].unlink(missing_ok=True)
 
     def _save_checkpoint_bundle(
         self, name, epoch, train_loss, val_loss,
@@ -533,7 +459,10 @@ class MetricStore:
             target_norm, pred_norm, pred_phys, profile_losses,
         )
 
-        image_key = "snapshots/best" if name == "best" else "snapshots/checkpoint"
+        if name == "best":
+            image_key = "snapshots/best"
+        else:
+            image_key = "snapshots/checkpoint"
         self.run.log({image_key: wandb.Image(str(fig_path))}, step=epoch)
 
         if upload_artifact:
@@ -553,39 +482,12 @@ class MetricStore:
         target_norm, pred_norm, pred_phys, profile_losses,
     ):
         """Save 4 side-by-side columns: Training, Validation, OOD Bare Oxide, OOD 2000 Å."""
-        fig, axes = plt.subplots(
-            3, 4,
-            figsize=(26.0, 11.5),
-            gridspec_kw={"height_ratios": [1.0, 1.15, 0.78]},
-            layout="constrained",
+        save_snapshot_figure(
+            path, epoch, self.loss_name, train_loss, val_loss,
+            self.column_titles, self.column_bare_flags, self.column_slds,
+            self.sample_s, self.sample_p, self.sample_q, self.sample_targets,
+            target_norm, pred_norm, pred_phys, profile_losses,
         )
-
-        s_np = self.sample_s.cpu().numpy()
-        p_np = self.sample_p.cpu().numpy()
-        q_np = self.sample_q.cpu().numpy()
-        t_phys = self.sample_targets.cpu().tolist()
-        p_phys = pred_phys.cpu().tolist()
-        t_norm = target_norm.cpu().tolist()
-        p_norm = pred_norm.cpu().tolist()
-
-        for col in range(4):
-            plot_sample_column(
-                axes[:, col],
-                self.column_titles[col],
-                q_np[col], s_np[col], p_np[col],
-                t_phys[col], p_phys[col], t_norm[col], p_norm[col],
-                profile_losses[col],
-                self.column_slds[col],
-                bare_oxide=self.column_bare_flags[col],
-            )
-
-        fig.suptitle(
-            f"Epoch {epoch}  |  Loss ({self.loss_name}): Train {train_loss:.2e}  ·  Val {val_loss:.2e}  |  "
-            f"OOD Profile L2: Bare Oxide {profile_losses[2]:.2e}  ·  2000 Å Film {profile_losses[3]:.2e}",
-            fontsize=15.5,
-        )
-        fig.savefig(path, dpi=200)
-        plt.close(fig)
 
     def finish(self):
         """Upload the final best checkpoint to W&B (when online) and close the run."""

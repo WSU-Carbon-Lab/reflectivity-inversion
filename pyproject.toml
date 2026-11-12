@@ -19,6 +19,7 @@ dependencies = [
 ]
 
 [tool.uv]
-# Scripts-only project: the code lives in scripts/ and is not installed.
+# Not installed: run the code from the project folder as modules, e.g.
+#   uv run python -m refltron.single_channel_mlp.train --input s
 package = false
 

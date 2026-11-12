@@ -27,8 +27,11 @@ def write_dataset_card(
     repo_id: str,
     revision: str,
     isotropic: bool,
+    fixed_q: bool,
     q_range: tuple[float, float],
     energy_ev: float,
+    theta_range_deg: tuple[float, float],
+    energy_range_ev: tuple[float, float],
     film_thickness_range: tuple[float, float],
     film_roughness_max: float,
     oxide_thickness_range: tuple[float, float],
@@ -46,6 +49,37 @@ def write_dataset_card(
     has_plots = copy_plots(dataset_dir, plot_dir)
     total_points = n_samples * n_q
 
+    # Text that depends on how the curves are measured.
+    if fixed_q:
+        measurement_text = (
+            f"**Fixed-q version.** Every curve is simulated at the same photon energy "
+            f"`E = {energy_ev:.0f} eV` on the same `{n_q}`-point, evenly spaced momentum-transfer grid "
+            f"`q ∈ [{q_range[0]}, {q_range[1]}] Å⁻¹`. The `q` column is identical in every row; it is "
+            "kept so the schema matches the variable-q branches."
+        )
+        example_text = f"on the fixed {n_q}-point `q` grid at {energy_ev:.0f} eV"
+        q_section = (
+            "Every curve shares the same evenly spaced `q` grid, so the `q` distribution is flat "
+            f"over `[{q_range[0]}, {q_range[1]}] Å⁻¹`."
+        )
+        q_column_text = "Fixed momentum transfer grid, identical in every row"
+    else:
+        measurement_text = (
+            "**Variable-q version.** Each curve mimics an experimental angle scan at an arbitrary "
+            f"soft X-ray photon energy: `{n_q}` random grazing angles "
+            f"`θ ∈ [{theta_range_deg[0]}°, {theta_range_deg[1]}°]` are drawn and sorted ascending, "
+            f"evaluated at a randomized photon energy `E ∈ [{energy_range_ev[0]:.0f}, {energy_range_ev[1]:.0f}] eV`, "
+            "and cast into momentum transfer `q = (4π / λ) sin θ` (`1/Å`). Photon energy is omitted "
+            "from the saved labels so downstream models learn an **energy-invariant** mapping "
+            "from `(q, R_s, R_p)` to the film parameters."
+        )
+        example_text = f"sampled at {n_q} random grazing angles and cast to `q`"
+        q_section = (
+            "Uniform sampling over `(θ, E)` produces dense coverage at low-to-intermediate `q` "
+            "with a high-`q` tail, and every curve has its own `q` grid."
+        )
+        q_column_text = "Ascending momentum transfer grid cast from `(θ, E)`"
+
     # Text that depends on the film type.
     if isotropic:
         film_name = "isotropic"
@@ -56,8 +90,10 @@ def write_dataset_card(
             "schema matches the uniaxial branches. Models only need 5 labels: film thickness, "
             "film roughness, oxide thickness, `delta_xx` and `beta_xx`."
         )
-        delta_xx_text, delta_zz_text = "Film dispersion `δ`", "Same as `delta_xx` (isotropic film)"
-        beta_xx_text, beta_zz_text = "Film absorption `β`", "Same as `beta_xx` (isotropic film)"
+        delta_xx_text = "Film dispersion `δ`"
+        delta_zz_text = "Same as `delta_xx` (isotropic film)"
+        beta_xx_text = "Film absorption `β`"
+        beta_zz_text = "Same as `beta_xx` (isotropic film)"
     else:
         film_name = "uniaxial anisotropic"
         optics_text = (
@@ -80,7 +116,7 @@ def write_dataset_card(
 ![Example s/p reflectivity curves and optical-constant depth profile](plots/single_sample.png)
 
 *Top: simulated `s`- and `p`-polarized power reflectivity `R_s(q)` and `R_p(q)`
-on the fixed {n_q}-point `q` grid at {energy_ev:.0f} eV. Bottom: corresponding
+{example_text}. Bottom: corresponding
 erf-smoothed refractive-index depth profile (`1 - n = δ - iβ`) showing
 in-plane (`δ_xx`, `β_xx`) and out-of-plane (`δ_zz`, `β_zz`) components across
 the `vacuum | film | oxide | silicon` interfaces.*
@@ -99,10 +135,9 @@ oxide thicknesses are drawn first, followed by film roughness capped at
 
 ![Parameter and optical tensor distributions across 1,000,000 samples](plots/dry_run_parameters.png)
 
-### Fresnel-Compensated `R · q⁴` Densities
+### `q` Grid & Fresnel-Compensated `R · q⁴` Densities
 
-Every curve shares the same evenly spaced `q` grid, so the `q` distribution is flat
-over `[{q_range[0]}, {q_range[1]}] Å⁻¹`.
+{q_section}
 
 ![q distribution and Fresnel-compensated R * q^4 joint densities](plots/dry_run_reflectivity_q4.png)
 """
@@ -135,11 +170,8 @@ Synthetic polarized soft X-ray reflectivity (`s` and `p` channels) simulated wit
 vacuum | {film_name} film | SiO2 oxide | Si substrate
 ```
 
-**Fixed-q version.** Every curve is simulated at the same photon energy
-`E = {energy_ev:.0f} eV` on the same `{n_q}`-point, evenly spaced momentum-transfer grid
-`q ∈ [{q_range[0]}, {q_range[1]}] Å⁻¹`. The `q` column is identical in every row; it is kept so
-the schema matches the `main` branch (random energy and random angles per curve).
-Models map `(R_s, R_p)` on this grid to structural and optical parameters.
+{measurement_text}
+
 {optics_text}
 {figures_section}
 ---
@@ -152,7 +184,7 @@ Models map `(R_s, R_p)` on this grid to structural and optical parameters.
 
 | Column | Arrow Type | Units / Range | Description |
 | :--- | :--- | :--- | :--- |
-| `q` | `fixed_size_list<float32>[{n_q}]` | `1/Å` | Fixed momentum transfer grid, identical in every row |
+| `q` | `fixed_size_list<float32>[{n_q}]` | `1/Å` | {q_column_text} |
 | `s` | `fixed_size_list<float32>[{n_q}]` | power reflectance | `s`-polarized reflectivity `R_s(q)` |
 | `p` | `fixed_size_list<float32>[{n_q}]` | power reflectance | `p`-polarized reflectivity `R_p(q)` |
 | `film_thickness` | `float32` | `Å`, `[{film_thickness_range[0]}, {film_thickness_range[1]}]` | Film thickness `t_film` |

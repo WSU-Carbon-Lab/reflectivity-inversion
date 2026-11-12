@@ -2,7 +2,6 @@
 
 import argparse
 from pathlib import Path
-import sys
 
 import matplotlib
 
@@ -13,17 +12,14 @@ import numpy as np
 import torch
 from torch import nn
 
-# Allow importing network.py, loss.py, metrics.py, and train.py from scripts/.
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(PROJECT_ROOT / "scripts"))
 
-from loss import LABEL_NAMES, LOSS_CHOICES, DepthProfileLoss, build_loss
-from metrics import build_ood_test_cases, pick_sample_near_thickness
-from network import REGULARIZER_CHOICES, ReflectivityNet
-from train import load_dataset
+from refltron.common.loss import LABEL_NAMES, LOSS_CHOICES, DepthProfileLoss, build_loss
+from refltron.common.paths import PROJECT_ROOT
+from refltron.multi_channel_mlp.metrics import build_ood_test_cases, pick_sample_near_thickness
+from refltron.multi_channel_mlp.network import REGULARIZER_CHOICES, ReflectivityNet
+from refltron.multi_channel_mlp.train import load_dataset
 
-sys.path.insert(0, str(PROJECT_ROOT / "analysis"))
-from diagnostics import ACTIVATIONS, VAL_SHARD, load_model  # noqa: E402
+from refltron.multi_channel_mlp.analysis.diagnostics import ACTIVATIONS, VAL_SHARD, load_model
 
 # Human-readable labels for each regularizer mode in ReflectivityNet.
 REGULARIZER_LABELS = {
@@ -189,7 +185,8 @@ def format_range(low, high):
 
 def print_stage_summary(model, stages, criterion, loss_name, targets, row_tags):
     """Print tensor shapes, value ranges, ReLU survival rates, and decoded predictions."""
-    s_name, p_name, _, _, _, _ = REGULARIZER_LABELS[model.regularizer]
+    s_name = REGULARIZER_LABELS[model.regularizer][0]
+    p_name = REGULARIZER_LABELS[model.regularizer][1]
     print(f"\nInspected rows (sorted thin -> thick): {row_tags}")
     header = (
         f"{'Stage':<34} | {'Shape':<14} | {'Pre-ReLU [min, max]':<23} | "
@@ -199,7 +196,9 @@ def print_stage_summary(model, stages, criterion, loss_name, targets, row_tags):
     print("-" * len(header))
 
     x = stages["stacked_input"]
-    for ch_idx, ch_name in enumerate((s_name, p_name, "Input ch2: q")):
+    channel_names = (s_name, p_name, "Input ch2: q")
+    for ch_idx in range(len(channel_names)):
+        ch_name = channel_names[ch_idx]
         vals = x[:, ch_idx, :]
         rng = format_range(vals.min().item(), vals.max().item())
         print(f"{ch_name:<34} | {str(tuple(vals.shape)):<14} | {rng:<23} | {'(no ReLU)':<23} | {'--':<10} | --")
@@ -207,14 +206,19 @@ def print_stage_summary(model, stages, criterion, loss_name, targets, row_tags):
     pre = stages["mixer_pre_relu"]
     post = stages["mixer_post_relu"]
     mixer_has_relu = stages["mixer_has_relu"]
-    mixer_suffix = "Conv1d + ReLU" if mixer_has_relu else "Conv1d, no ReLU"
+    if mixer_has_relu:
+        mixer_suffix = "Conv1d + ReLU"
+    else:
+        mixer_suffix = "Conv1d, no ReLU"
     for ch in range(pre.size(1)):
         ch_pre = pre[:, ch, :]
         ch_post = post[:, ch, :]
         pre_rng = format_range(ch_pre.min().item(), ch_pre.max().item())
         if mixer_has_relu:
             active_pct = 100.0 * (ch_post > 0).float().mean().item()
-            dead_pct = 100.0 * (~(ch_post != 0).any(dim=0)).float().mean().item()
+            # A position is dead when it is exactly 0 for every row.
+            always_zero = ch_post.abs().max(dim=0).values == 0
+            dead_pct = 100.0 * always_zero.float().mean().item()
             post_rng = format_range(ch_post.min().item(), ch_post.max().item())
             print(
                 f"{f'Mixer ch{ch} ({mixer_suffix})':<34} | {str(tuple(ch_post.shape)):<14} | "
@@ -230,7 +234,8 @@ def print_stage_summary(model, stages, criterion, loss_name, targets, row_tags):
     flat_rng = format_range(flat.min().item(), flat.max().item())
     if mixer_has_relu:
         flat_active = 100.0 * (flat > 0).float().mean().item()
-        flat_dead = 100.0 * (~(flat != 0).any(dim=0)).float().mean().item()
+        always_zero = flat.abs().max(dim=0).values == 0
+        flat_dead = 100.0 * always_zero.float().mean().item()
         print(
             f"{'Flatten (8 x 256 -> 2048)':<34} | {str(tuple(flat.shape)):<14} | "
             f"{'(from mixer)':<23} | {flat_rng:<23} | {flat_active:6.1f}%    | {flat_dead:5.1f}%"
@@ -247,7 +252,9 @@ def print_stage_summary(model, stages, criterion, loss_name, targets, row_tags):
         pre_rng = format_range(l_pre.min().item(), l_pre.max().item())
         if layer["has_relu"]:
             active_pct = 100.0 * (l_post > 0).float().mean().item()
-            dead_pct = 100.0 * (~(l_post > 0).any(dim=0)).float().mean().item()
+            # A neuron is dead when it is never above 0 for any row.
+            never_positive = l_post.max(dim=0).values <= 0
+            dead_pct = 100.0 * never_positive.float().mean().item()
             post_rng = format_range(l_post.min().item(), l_post.max().item())
             print(
                 f"{layer['name']:<34} | {str(tuple(l_post.shape)):<14} | "
@@ -267,11 +274,16 @@ def print_stage_summary(model, stages, criterion, loss_name, targets, row_tags):
     )
 
     pred_phys = criterion.denormalize(out)
-    profile_eval = criterion if type(criterion) is DepthProfileLoss else DepthProfileLoss()
+    # Always report the depth-profile distance, whatever loss the run trained with.
+    if type(criterion) is DepthProfileLoss:
+        profile_eval = criterion
+    else:
+        profile_eval = DepthProfileLoss()
     profile_l2 = profile_eval.per_sample_loss(out, targets, stages["raw_q"])
 
     print(f"\nThickness & depth-profile L2 check (decoded via loss={loss_name!r}):")
-    for i, tag in enumerate(row_tags):
+    for i in range(len(row_tags)):
+        tag = row_tags[i]
         true_t = targets[i, 0].item()
         pred_t = pred_phys[i, 0].item()
         prof_err = profile_l2[i].item()
@@ -283,7 +295,11 @@ def print_stage_summary(model, stages, criterion, loss_name, targets, row_tags):
 
 def plot_curves_and_mixer(path, model, stages, row_tags, targets, highlight_pos, ckpt_path):
     """Figure 1: Visualize curve stages (Raw R -> Regularizer -> 8 Mixer Channels)."""
-    _, _, s_tex, p_tex, y_tex, stage1a_title = REGULARIZER_LABELS[model.regularizer]
+    labels = REGULARIZER_LABELS[model.regularizer]
+    s_tex = labels[2]
+    p_tex = labels[3]
+    y_tex = labels[4]
+    stage1a_title = labels[5]
 
     fig = plt.figure(figsize=(18.0, 12.5), layout="constrained")
     grid = fig.add_gridspec(3, 4, height_ratios=[1.15, 1.0, 1.0])
@@ -332,13 +348,12 @@ def plot_curves_and_mixer(path, model, stages, row_tags, targets, highlight_pos,
     ax_rq4.legend(loc="upper right", fontsize=8.5)
 
     # Panel 1C: Stage 1b — All 3 stacked input channels on the same y-axis.
-    ch_specs = (
-        (0, "tab:blue", f"ch0 (S): {s_tex}"),
-        (1, "tab:red", f"ch1 (P): {p_tex}"),
-        (2, "tab:green", r"ch2: $q$ [$\mathrm{\AA}^{-1}$]"),
-    )
+    channel_colors = ("tab:blue", "tab:red", "tab:green")
+    channel_labels = (f"ch0 (S): {s_tex}", f"ch1 (P): {p_tex}", r"ch2: $q$ [$\mathrm{\AA}^{-1}$]")
     ax_stack.axhline(0.0, color="0.35", linestyle=":", linewidth=1.0)
-    for ch_idx, color, label in ch_specs:
+    for ch_idx in range(3):
+        color = channel_colors[ch_idx]
+        label = channel_labels[ch_idx]
         ch_min = stacked[:, ch_idx, :].min(axis=0)
         ch_max = stacked[:, ch_idx, :].max(axis=0)
         ax_stack.fill_between(idx_axis, ch_min, ch_max, color=color, alpha=0.16)
@@ -380,10 +395,16 @@ def plot_curves_and_mixer(path, model, stages, row_tags, targets, highlight_pos,
 
         # Pad the bottom of each subplot slightly so the learned formula box stays clear of the curves.
         y_lo, y_hi = ax.get_ylim()
-        span = y_hi - y_lo if y_hi > y_lo else 1.0
+        if y_hi > y_lo:
+            span = y_hi - y_lo
+        else:
+            span = 1.0
         ax.set_ylim(y_lo - 0.16 * span, y_hi + 0.06 * span)
 
-        w_s, w_p, w_q = weights[ch]
+        # This channel's learned weights for S, P and q, and its bias.
+        w_s = weights[ch][0]
+        w_p = weights[ch][1]
+        w_q = weights[ch][2]
         b_c = biases[ch]
         formula = f"z = {w_s:+.2f}·S {w_p:+.2f}·P {w_q:+.2f}·q {b_c:+.2f}"
         ax.text(
@@ -398,7 +419,10 @@ def plot_curves_and_mixer(path, model, stages, row_tags, targets, highlight_pos,
             status = "DEAD (0% active)"
         else:
             status = f"{active_pct:.0f}% active"
-        title_color = "#a61c1c" if is_dead else "0.1"
+        if is_dead:
+            title_color = "#a61c1c"
+        else:
+            title_color = "0.1"
         ax.set_title(f"Stage 2 — Mixer Ch {ch}: {status}", color=title_color, fontsize=10.5)
         ax.set_xlabel("array index i (0 .. 255)")
         if ch % 4 == 0:
@@ -429,7 +453,9 @@ def plot_flatten_and_mlp(path, model, stages, criterion, loss_name, row_tags, ta
         layout="constrained",
     )
 
-    row_labels = [f"{tag} ({targets[i, 0].item():.0f} Å)" for i, tag in enumerate(row_tags)]
+    row_labels = []
+    for i in range(len(row_tags)):
+        row_labels.append(f"{row_tags[i]} ({targets[i, 0].item():.0f} Å)")
     y_ticks = np.arange(len(row_tags))
 
     # Shared colormap for ReLU activations: exact zeros show up as clean light gray.
@@ -437,13 +463,17 @@ def plot_flatten_and_mlp(path, model, stages, criterion, loss_name, row_tags, ta
     relu_cmap.set_bad("#f1f3f5")
 
     # --- Row 0: Stage 3 — Flatten (8 x 256 -> 2048) ---
-    ax_flat, ax_flat_bar = axes[0]
+    ax_flat = axes[0, 0]
+    ax_flat_bar = axes[0, 1]
     flat_np = stages["flattened"].numpy()
     mixer_has_relu = stages["mixer_has_relu"]
 
     if mixer_has_relu:
         flat_masked = np.ma.masked_where(flat_np <= 0.0, flat_np)
-        flat_vmax = float(np.percentile(flat_np[flat_np > 0], 99)) if np.any(flat_np > 0) else 1.0
+        if np.any(flat_np > 0):
+            flat_vmax = float(np.percentile(flat_np[flat_np > 0], 99))
+        else:
+            flat_vmax = 1.0
         im_flat = ax_flat.imshow(flat_masked, aspect="auto", interpolation="nearest", cmap=relu_cmap, vmin=0.0, vmax=flat_vmax)
         fig.colorbar(im_flat, ax=ax_flat, pad=0.012, fraction=0.025, label="post-ReLU")
         flat_note = "[gray = 0 after ReLU]"
@@ -458,50 +488,70 @@ def plot_flatten_and_mlp(path, model, stages, criterion, loss_name, row_tags, ta
     for ch in range(1, n_mix):
         ax_flat.axvline(ch * n_q - 0.5, color="0.35", linestyle="--", linewidth=0.9)
 
-    ch_centers = [ch * n_q + n_q // 2 for ch in range(n_mix)]
-    ch_tags = [
-        f"Ch {ch} (dead)"
-        if (mixer_has_relu and not np.any(flat_np[:, ch * n_q : (ch + 1) * n_q] != 0))
-        else f"Ch {ch}"
-        for ch in range(n_mix)
-    ]
+    # Label each mixer channel's block of the flattened vector at its centre.
+    ch_centers = []
+    ch_tags = []
+    for ch in range(n_mix):
+        ch_centers.append(ch * n_q + n_q // 2)
+        block = flat_np[:, ch * n_q : (ch + 1) * n_q]
+        if mixer_has_relu and not np.any(block != 0):
+            ch_tags.append(f"Ch {ch} (dead)")
+        else:
+            ch_tags.append(f"Ch {ch}")
     top_ax = ax_flat.secondary_xaxis("top")
     top_ax.set_xticks(ch_centers, ch_tags, fontsize=8.0)
     top_ax.tick_params(length=0)
-    for ch, tick_label in enumerate(top_ax.get_xticklabels()):
+    tick_labels = top_ax.get_xticklabels()
+    for ch in range(len(tick_labels)):
         if "dead" in ch_tags[ch]:
-            tick_label.set_color("#a61c1c")
+            tick_labels[ch].set_color("#a61c1c")
 
     ax_flat.set_yticks(y_ticks, row_labels, fontsize=7.8)
     ax_flat.set_xlabel(f"flattened feature index (0 .. {flat_np.shape[1] - 1})")
     ax_flat.set_title(f"Stage 3: Flatten ({n_mix} × {n_q} → {flat_np.shape[1]})  {flat_note}")
 
     mixer_post = stages["mixer_post_relu"].numpy()
-    ch_active_pct = [100.0 * float((mixer_post[:, ch, :] > 0).mean()) for ch in range(n_mix)]
-    bar_colors = ["#d9534f" if (mixer_has_relu and pct == 0.0) else "tab:blue" for pct in ch_active_pct]
+    ch_active_pct = []
+    bar_colors = []
+    bar_names = []
+    for ch in range(n_mix):
+        pct = 100.0 * float((mixer_post[:, ch, :] > 0).mean())
+        ch_active_pct.append(pct)
+        if mixer_has_relu and pct == 0.0:
+            bar_colors.append("#d9534f")  # dead channel
+        else:
+            bar_colors.append("tab:blue")
+        bar_names.append(f"Ch {ch}")
     ax_flat_bar.bar(np.arange(n_mix), ch_active_pct, color=bar_colors, width=0.65)
-    ax_flat_bar.set_xticks(np.arange(n_mix), [f"Ch {c}" for c in range(n_mix)], fontsize=8.5)
+    ax_flat_bar.set_xticks(np.arange(n_mix), bar_names, fontsize=8.5)
     ax_flat_bar.set_ylim(0, 112)
     ax_flat_bar.set_ylabel("% > 0")
-    ax_flat_bar.set_title(
-        "Surviving Fraction per Mixer Channel" if mixer_has_relu else "Positive Fraction per Mixer Channel (no ReLU)"
-    )
+    if mixer_has_relu:
+        ax_flat_bar.set_title("Surviving Fraction per Mixer Channel")
+    else:
+        ax_flat_bar.set_title("Positive Fraction per Mixer Channel (no ReLU)")
     ax_flat_bar.grid(True, axis="y", alpha=0.3)
 
     # --- Rows 1..n_mlp: Hidden MLP Layers ---
-    for idx, layer in enumerate(stages["mlp_layers"]):
-        ax_hm, ax_hist = axes[1 + idx]
+    for idx in range(len(stages["mlp_layers"])):
+        layer = stages["mlp_layers"][idx]
+        ax_hm = axes[1 + idx, 0]
+        ax_hist = axes[1 + idx, 1]
         pre_np = layer["pre_relu"].numpy()
         post_np = layer["post_relu"].numpy()
         has_relu = layer["has_relu"]
 
         if has_relu:
             masked_post = np.ma.masked_where(post_np <= 0.0, post_np)
-            vmax = float(np.percentile(post_np[post_np > 0], 99)) if np.any(post_np > 0) else 1.0
+            if np.any(post_np > 0):
+                vmax = float(np.percentile(post_np[post_np > 0], 99))
+            else:
+                vmax = 1.0
             im = ax_hm.imshow(masked_post, aspect="auto", interpolation="nearest", cmap=relu_cmap, vmin=0.0, vmax=vmax)
             fig.colorbar(im, ax=ax_hm, pad=0.012, fraction=0.025, label="post-ReLU")
             active_pct = 100.0 * float((post_np > 0).mean())
-            dead_pct = 100.0 * float((~(post_np > 0).any(axis=0)).mean())
+            never_positive = post_np.max(axis=0) <= 0  # neurons that are 0 for every row
+            dead_pct = 100.0 * float(never_positive.mean())
             hm_title = f"Stage {4 + idx}: {layer['name']} + ReLU  —  {active_pct:.1f}% active, {dead_pct:.1f}% dead across rows"
         else:
             lim = max(float(np.percentile(np.abs(post_np), 99)), 1e-6)
@@ -516,14 +566,21 @@ def plot_flatten_and_mlp(path, model, stages, criterion, loss_name, row_tags, ta
         # Clip extreme outliers at the 2nd/98th percentile so the 0 threshold is easy to see.
         flat_pre = pre_np.ravel()
         lo_clip = float(np.percentile(flat_pre, 2.0))
-        hi_clip = float(np.percentile(flat_pre, 98.0)) if not has_relu else float(flat_pre.max())
+        if has_relu:
+            hi_clip = float(flat_pre.max())
+        else:
+            hi_clip = float(np.percentile(flat_pre, 98.0))
         clipped_pre = np.clip(flat_pre, lo_clip, max(hi_clip, lo_clip + 1e-6))
 
         neg_vals = clipped_pre[clipped_pre <= 0.0]
         pos_vals = clipped_pre[clipped_pre > 0.0]
         bins = np.linspace(min(lo_clip, -0.1), max(hi_clip, 0.5), 36)
-        neg_label = "≤ 0 (zeroed by ReLU)" if has_relu else "≤ 0 (kept — no ReLU)"
-        pos_label = "> 0 (kept by ReLU)" if has_relu else "> 0 (kept — no ReLU)"
+        if has_relu:
+            neg_label = "≤ 0 (zeroed by ReLU)"
+            pos_label = "> 0 (kept by ReLU)"
+        else:
+            neg_label = "≤ 0 (kept — no ReLU)"
+            pos_label = "> 0 (kept — no ReLU)"
         ax_hist.hist(neg_vals, bins=bins, color="#e07a7a", alpha=0.85, label=neg_label)
         ax_hist.hist(pos_vals, bins=bins, color="tab:blue", alpha=0.85, label=pos_label)
         ax_hist.axvline(0.0, color="0.15", linestyle="--", linewidth=1.1)
@@ -534,7 +591,8 @@ def plot_flatten_and_mlp(path, model, stages, criterion, loss_name, row_tags, ta
         ax_hist.legend(loc="upper left", fontsize=7.5)
 
     # --- Final Row: Output Layer Linear(100 -> 7) vs Ground Truth ---
-    ax_out, ax_thick = axes[-1]
+    ax_out = axes[-1, 0]
+    ax_thick = axes[-1, 1]
     pred_norm = stages["output_norm"].numpy()
     true_norm = criterion.normalize(targets).numpy()
     err_norm = pred_norm - true_norm
@@ -545,7 +603,10 @@ def plot_flatten_and_mlp(path, model, stages, criterion, loss_name, row_tags, ta
     fig.colorbar(im_out, ax=ax_out, pad=0.012, fraction=0.025, label="pred − truth")
     for r in range(pred_norm.shape[0]):
         for c in range(pred_norm.shape[1]):
-            text_color = "white" if abs(err_norm[r, c]) > 0.22 else "0.12"
+            if abs(err_norm[r, c]) > 0.22:
+                text_color = "white"  # dark cell: light text
+            else:
+                text_color = "0.12"
             ax_out.text(
                 c, r, f"{pred_norm[r, c]:.2f} ({true_norm[r, c]:.2f})",
                 ha="center", va="center", fontsize=7.6, color=text_color,
@@ -580,13 +641,13 @@ def find_checkpoint(requested_path):
     """Return the requested checkpoint or the most recently saved best.pt."""
     if requested_path is not None:
         return Path(requested_path)
-    candidates = sorted(
-        (PROJECT_ROOT / "checkpoints").glob("*/best.pt"),
-        key=lambda p: p.stat().st_mtime,
-    )
-    if not candidates:
+    newest = None
+    for path in (PROJECT_ROOT / "checkpoints").glob("*/best.pt"):
+        if newest is None or path.stat().st_mtime >= newest.stat().st_mtime:
+            newest = path
+    if newest is None:
         raise FileNotFoundError("No checkpoints/*/best.pt found. Pass --checkpoint <path>.")
-    return candidates[-1]
+    return newest
 
 
 def load_trained_model(ckpt_path, regularizer_override=None, loss_override=None):
@@ -594,41 +655,82 @@ def load_trained_model(ckpt_path, regularizer_override=None, loss_override=None)
     model, criterion, meta = load_model(ckpt_path)
     if regularizer_override:
         model.regularizer = regularizer_override
-    loss_name = loss_override or meta["loss"]
     if loss_override:
+        loss_name = loss_override
         criterion = build_loss(loss_override)
+    else:
+        loss_name = meta["loss"]
     ckpt = {"epoch": meta["epoch"], "val_loss": meta["val_loss"]}
     return model, criterion, loss_name, ckpt
 
 
 def load_example_rows(data_path, num_rows, explicit_rows, include_ood=False):
     """Load example training rows (plus optional OOD cases) sorted thin -> thick."""
-    max_needed = (max(explicit_rows) + 1) if explicit_rows else num_rows
-    dataset = load_dataset(data_path or str(VAL_SHARD), max_samples=max_needed)
-    raw_indices = list(explicit_rows) if explicit_rows else list(range(num_rows))
+    if explicit_rows:
+        raw_indices = list(explicit_rows)
+    else:
+        raw_indices = list(range(num_rows))
+    max_needed = max(raw_indices) + 1
+    if data_path is None:
+        data_path = str(VAL_SHARD)  # default: the held-out validation shard
+    dataset = load_dataset(data_path, max_samples=max_needed)
 
     # Highlight the in-distribution training row closest to ~200 Å in the curve plots.
     hero_dataset_idx = pick_sample_near_thickness(dataset, raw_indices, target_thickness=200.0)
 
-    records = [
-        (f"Row #{i}", i == hero_dataset_idx, dataset[i][0], dataset[i][1], dataset[i][2], dataset[i][3])
-        for i in raw_indices
-    ]
+    # One entry per row in each list: name, highlighted?, s, p, q, labels.
+    tags = []
+    is_hero = []
+    s_rows = []
+    p_rows = []
+    q_rows = []
+    target_rows = []
+    for i in raw_indices:
+        row = dataset[i]
+        tags.append(f"Row #{i}")
+        is_hero.append(i == hero_dataset_idx)
+        s_rows.append(row[0])
+        p_rows.append(row[1])
+        q_rows.append(row[2])
+        target_rows.append(row[3])
 
     if include_ood:
         ood_cases = build_ood_test_cases()
-        records.append(("OOD 0Å", False, ood_cases[0]["s"], ood_cases[0]["p"], ood_cases[0]["q"], ood_cases[0]["target"]))
-        records.append(("OOD 2000Å", False, ood_cases[1]["s"], ood_cases[1]["p"], ood_cases[1]["q"], ood_cases[1]["target"]))
+        ood_tags = ("OOD 0Å", "OOD 2000Å")
+        for k in range(2):
+            tags.append(ood_tags[k])
+            is_hero.append(False)
+            s_rows.append(ood_cases[k]["s"])
+            p_rows.append(ood_cases[k]["p"])
+            q_rows.append(ood_cases[k]["q"])
+            target_rows.append(ood_cases[k]["target"])
 
-    # Sort all rows from thinnest to thickest true film_thickness.
-    records.sort(key=lambda rec: rec[5][0].item())
+    # Sort all rows from thinnest to thickest true film_thickness (ties keep their order).
+    thicknesses = []
+    for target in target_rows:
+        thicknesses.append(target[0].item())
+    order = np.argsort(thicknesses, kind="stable")
 
-    row_tags = [rec[0] for rec in records]
-    highlight_pos = next(idx for idx, rec in enumerate(records) if rec[1])
-    s = torch.stack([rec[2] for rec in records])
-    p = torch.stack([rec[3] for rec in records])
-    q = torch.stack([rec[4] for rec in records])
-    targets = torch.stack([rec[5] for rec in records])
+    row_tags = []
+    highlight_pos = None
+    for position in range(len(order)):
+        k = order[position]
+        row_tags.append(tags[k])
+        if is_hero[k] and highlight_pos is None:
+            highlight_pos = position
+    sorted_s = []
+    sorted_p = []
+    sorted_q = []
+    sorted_targets = []
+    for k in order:
+        sorted_s.append(s_rows[k])
+        sorted_p.append(p_rows[k])
+        sorted_q.append(q_rows[k])
+        sorted_targets.append(target_rows[k])
+    s = torch.stack(sorted_s)
+    p = torch.stack(sorted_p)
+    q = torch.stack(sorted_q)
+    targets = torch.stack(sorted_targets)
     return row_tags, s, p, q, targets, highlight_pos
 
 
