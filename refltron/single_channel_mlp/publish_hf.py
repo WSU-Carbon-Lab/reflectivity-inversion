@@ -138,8 +138,9 @@ def main():
     for i in range(len(summaries)):
         summary = summaries[i]
         api.create_branch(args.repo, branch=summary["branch"], exist_ok=True)
+        # A new branch starts as a copy of main, so first drop main's figures from it.
         api.upload_folder(repo_id=args.repo, folder_path=run_dirs[i], revision=summary["branch"],
-                          commit_message=f"{summary['branch']}: {summary['desc']}")
+                          commit_message=f"{summary['branch']}: {summary['desc']}", delete_patterns=["figures/*"])
         print(f"uploaded {summary['branch']}")
     print(f"https://huggingface.co/{args.repo}")
 
