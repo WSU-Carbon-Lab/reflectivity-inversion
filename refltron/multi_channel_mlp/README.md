@@ -104,9 +104,8 @@ uv run python -m refltron.multi_channel_mlp.train --resume checkpoints/<run>/bes
 uv run python -m refltron.multi_channel_mlp.train --help
 ```
 
-`--local` keeps W&B offline, so no login is needed. Without it the script starts W&B
-online and asks for credentials, so always pass it when training locally (or set
-`LOCAL = True` at the top of `train.py`).
+`--local` is the default: W&B stays offline, so no login is needed. `--no-local` starts
+W&B online and asks for credentials.
 
 The defaults at the top of `train.py` are the best published configuration, `v2-relu-log`.
 Compared to the single-channel recipe:

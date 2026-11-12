@@ -47,9 +47,8 @@ without you having to activate it.
 ### 3. Accounts and logins
 
 **Weights & Biases (optional, skip it if you train locally).** We train locally, so you
-do not need a W&B account or login. Pass `--local` to a training script (it is already the
-default for the single-channel one; the multi-channel one needs the flag, or set `LOCAL = True`
-at the top of its `train.py`). W&B then runs in offline mode: it writes everything under
+do not need a W&B account or login. Pass `--local` to a training script (it is the
+default in both trainers; `--no-local` turns it off). W&B then runs in offline mode: it writes everything under
 `./wandb/` and never contacts a server. You can still `wandb sync` those runs later.
 
 If you do want your runs in the browser, they go to a hosted W&B instance, not the public
@@ -60,7 +59,7 @@ uv run wandb login --host https://api.forge.coreweave.com
 ```
 
 It will ask for an API key, which you get from that site once you have been added to the
-`als-rixs` team. Ask Harlan to add you. Without a login, always train with `--local`; without that flag
+`als-rixs` team. Ask Harlan to add you. Without a login, leave `--local` on (the default); with `--no-local`
 the script starts W&B online and asks for credentials.
 
 **Hugging Face** hosts the training data and the trained models under the `carbon-lab`

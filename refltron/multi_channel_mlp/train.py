@@ -59,7 +59,7 @@ SEED = 42                   # random seed, so runs are repeatable
 DEVICE = "auto"             # "auto" picks CUDA, then Apple MPS, then CPU
 
 # --- Logging and checkpoints (see metrics.py) ---
-LOCAL = False               # True = keep W&B offline and save fewer checkpoints
+LOCAL = True                # True = keep W&B offline (sync later) and save fewer checkpoints
 RUN_NAME = None             # optional W&B run name
 CHECKPOINT_DIR = Path("checkpoints")
 CHECKPOINT_EVERY = None     # save a numbered checkpoint every N epochs (None = 20 with LOCAL, else 5)
